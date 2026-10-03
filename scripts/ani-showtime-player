@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+video="${1:?video URL required}"
+referrer="${2:-https://zokoanime.video/}"
+subtitle="${3:-}"
+title="${4:-Anime}"
+
+# Remote/agent shells may not inherit the graphical session environment.
+# Recover it from the running Caelestia shell so Showtime can still launch.
+if [[ -z "${WAYLAND_DISPLAY:-}" || -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+  shell_pid="$(systemctl --user show -p MainPID --value caelestia-shell.service 2>/dev/null || true)"
+  if [[ -n "$shell_pid" && "$shell_pid" != "0" && -r "/proc/$shell_pid/environ" ]]; then
+    while IFS= read -r -d '' kv; do
+      case "$kv" in
+        WAYLAND_DISPLAY=*|HYPRLAND_INSTANCE_SIGNATURE=*|DBUS_SESSION_BUS_ADDRESS=*|XDG_RUNTIME_DIR=*) export "$kv" ;;
+      esac
+    done < "/proc/$shell_pid/environ"
+  fi
+fi
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$UID}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+port="$(python3 - <<'PY'
+import socket
+s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()
+PY
+)"
+rundir="${XDG_RUNTIME_DIR:-/run/user/$UID}/ani-showtime"
+mkdir -p "$rundir"
+log="$rundir/${port}.log"
+python3 "$root/ani-showtime-proxy.py" --video "$video" --subtitle "$subtitle" --referrer "$referrer" --port "$port" >"$log" 2>&1 &
+proxy_pid=$!
+cleanup(){ kill "$proxy_pid" 2>/dev/null || true; }
+trap cleanup EXIT INT TERM HUP
+for _ in $(seq 1 40); do
+  if grep -q '^http://' "$log" 2>/dev/null; then break; fi
+  kill -0 "$proxy_pid" 2>/dev/null || { cat "$log" >&2; exit 1; }
+  sleep .05
+done
+url="http://127.0.0.1:${port}/master.m3u8"
+flatpak run --share=network org.gnome.Showtime --new-window "$url" >/dev/null 2>&1 || true
+wait "$proxy_pid" || true

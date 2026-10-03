@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+self="$(readlink -f -- "${BASH_SOURCE[0]}")"
+root="$(cd -- "$(dirname -- "$self")" && pwd)"
+src=/usr/bin/ani-cli
+cache="${XDG_CACHE_HOME:-$HOME/.cache}/ani-cli-showtime"
+mkdir -p "$cache"
+hash="$(sha256sum "$src" | awk '{print $1}')"
+if [[ ! -x "$cache/ani-cli" || ! -f "$cache/source.sha256" || "$(cat "$cache/source.sha256")" != "$hash" ]]; then
+  python3 - "$src" "$cache/ani-cli" <<'PY'
+from pathlib import Path
+import sys
+src=Path(sys.argv[1]).read_text()
+needle='        *flatpak*mpv*) flatpak run io.mpv.Mpv --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 & ;;'
+insert='        *showtime*) nohup $player_function "$video_link" "$refr" "$sub_link" "${anime_title} Episode ${ep_no}" >/dev/null 2>&1 & ;;\n'+needle
+if needle not in src:
+    raise SystemExit('ani-cli player dispatch changed; refusing to apply stale Showtime patch')
+src=src.replace(needle,insert,1)
+Path(sys.argv[2]).write_text(src)
+PY
+  chmod +x "$cache/ani-cli"
+  printf '%s\n' "$hash" > "$cache/source.sha256"
+fi
+export ANI_CLI_PLAYER="${ANI_CLI_PLAYER:-$root/ani-showtime-player}"
+exec "$cache/ani-cli" "$@"

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+self="$(readlink -f -- "${BASH_SOURCE[0]}")"
+root="$(cd -- "$(dirname -- "$self")" && pwd)"
+mkdir -p "$HOME/.local/bin"
+if ! flatpak info org.gnome.Showtime >/dev/null 2>&1; then
+  flatpak install --user -y flathub org.gnome.Showtime
+fi
+ln -sfn "$root/ani-cli-showtime" "$HOME/.local/bin/ani-cli"
+xdg-mime default org.gnome.Showtime.desktop video/mp4
+xdg-mime default org.gnome.Showtime.desktop video/x-matroska
+xdg-mime default org.gnome.Showtime.desktop application/vnd.apple.mpegurl
+printf 'Showtime integration installed. ani-cli -> %s\n' "$(readlink -f "$HOME/.local/bin/ani-cli")"

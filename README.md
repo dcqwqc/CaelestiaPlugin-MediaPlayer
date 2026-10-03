@@ -15,13 +15,17 @@ A touch-first premium media surface for Caelestia. It adds a **Media+** dashboar
 - all chrome comes from Caelestia `Colours`/`Tokens`; no hard-coded green, purple or black popup styling
 
 
-## ani-cli / mpv player skin
+## ani-cli / Showtime integration
 
-PremiumMedia now also owns the actual player experience used by `ani-cli`, rather than only the Caelestia dashboard controller. `scripts/install-player-ui` installs uosc and Thumbfast when missing and then applies the bundled `mpv/` configuration.
+PremiumMedia uses GNOME Showtime as the real `ani-cli` player on Mirai. The integration keeps Showtime's native GTK/libadwaita UI instead of skinning mpv.
 
-The player disables mpv's legacy OSC and replaces it with a black/white proximity-based uosc surface: large touch-friendly transport buttons, a clean timeline, volume control, subtitle/audio access, fullscreen controls, restrained window chrome, and Thumbfast timeline previews. Controls disappear while watching and reveal near the relevant edge. The existing mpv MPRIS plugin is preserved so Media+ can control the same playback session.
+`~/.local/bin/ani-cli` points to `scripts/ani-cli-showtime`, which transparently patches the system ani-cli player dispatch at runtime and preserves normal search, episode, quality, history and subtitle resolution. The system `/usr/bin/ani-cli` file is left untouched. If the packaged ani-cli script changes, the cached patched copy is regenerated automatically from the new system version.
 
-On Mirai the player configuration lives in `~/.config/mpv`. A timestamped backup was created before the first migration.
+Protected HLS streams are opened through `ani-showtime-player` and `ani-showtime-proxy.py`. The proxy binds only to `127.0.0.1`, injects ani-cli's required upstream referrer, rewrites the HLS playlist/segments locally, and exposes the subtitle track as HLS WebVTT. Showtime therefore retains native HLS seeking instead of receiving a non-seekable remux. The proxy exits automatically after playback becomes idle.
+
+Showtime is also registered as the default app for common video/HLS MIME types. Its MPRIS interface exposes play/pause and seeking to Caelestia Media+.
+
+Run `scripts/install-showtime-integration` to install/repair this integration.
 
 ## Theme polish
 
