@@ -14,6 +14,15 @@ A touch-first premium media surface for Caelestia. It adds a **Media+** dashboar
 - responsive compact layout and enlarged configurable touch targets
 - all chrome comes from Caelestia `Colours`/`Tokens`; no hard-coded green, purple or black popup styling
 
+
+## ani-cli / mpv player skin
+
+PremiumMedia now also owns the actual player experience used by `ani-cli`, rather than only the Caelestia dashboard controller. `scripts/install-player-ui` installs uosc and Thumbfast when missing and then applies the bundled `mpv/` configuration.
+
+The player disables mpv's legacy OSC and replaces it with a black/white proximity-based uosc surface: large touch-friendly transport buttons, a clean timeline, volume control, subtitle/audio access, fullscreen controls, restrained window chrome, and Thumbfast timeline previews. Controls disappear while watching and reveal near the relevant edge. The existing mpv MPRIS plugin is preserved so Media+ can control the same playback session.
+
+On Mirai the player configuration lives in `~/.config/mpv`. A timestamped backup was created before the first migration.
+
 ## Theme polish
 
 The optional **Match Hyprland chrome** setting applies the current Caelestia palette to Hyprland's active/inactive borders and shadows at runtime. It is intentionally non-destructive: no Hyprland config file is edited. Before its first change, the plugin snapshots the four affected runtime colours. Disabling or unloading it restores only those values, leaving unrelated runtime plugin settings untouched.

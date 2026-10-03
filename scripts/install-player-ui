@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+CFG="${XDG_CONFIG_HOME:-$HOME/.config}/mpv"
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+mkdir -p "$CFG/scripts" "$CFG/script-opts"
+
+if [[ ! -f "$CFG/scripts/uosc/main.lua" ]]; then
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/tomasklaen/uosc/HEAD/installers/unix.sh)"
+fi
+if [[ ! -f "$CFG/scripts/thumbfast.lua" ]]; then
+  curl -fsSL https://raw.githubusercontent.com/po5/thumbfast/master/thumbfast.lua -o "$CFG/scripts/thumbfast.lua"
+fi
+
+cp "$ROOT/mpv/mpv.conf" "$CFG/mpv.conf"
+cp "$ROOT/mpv/input.conf" "$CFG/input.conf"
+cp "$ROOT/mpv/uosc.conf" "$CFG/script-opts/uosc.conf"
+cp "$ROOT/mpv/thumbfast.conf" "$CFG/script-opts/thumbfast.conf"
+printf 'PremiumMedia mpv UI installed to %s\n' "$CFG"
