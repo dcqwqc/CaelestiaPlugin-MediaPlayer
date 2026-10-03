@@ -16,7 +16,7 @@ A touch-first premium media surface for Caelestia. It adds a **Media+** dashboar
 
 ## Theme polish
 
-The optional **Match Hyprland chrome** setting applies the current Caelestia palette to Hyprland's active/inactive borders and shadows at runtime. It is intentionally non-destructive: no Hyprland config file is edited. Disabling the option or unloading the plugin calls `hyprctl reload` to restore the configured values.
+The optional **Match Hyprland chrome** setting applies the current Caelestia palette to Hyprland's active/inactive borders and shadows at runtime. It is intentionally non-destructive: no Hyprland config file is edited. Before its first change, the plugin snapshots the four affected runtime colours. Disabling or unloading it restores only those values, leaving unrelated runtime plugin settings untouched.
 
 This fixes stale system chrome such as overly green/purple borders and shadows. It cannot recolor arbitrary third-party application windows that draw their own black dialogs; those need to be fixed in the owning application/theme. Every surface owned by this plugin itself is palette-derived.
 
