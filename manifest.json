@@ -1,0 +1,13 @@
+{
+  "name": "PremiumMedia",
+  "version": "0.1.0",
+  "author": "dcqwqc",
+  "homepage": "https://github.com/dcqwqc/CaelestiaPlugin-PremiumMedia",
+  "icon": "music_note",
+  "description": "A premium touch-first media dashboard for Caelestia with native MPRIS, volume and brightness controls plus optional palette-synchronised Hyprland chrome.",
+  "entryPoints": [
+    {"type":"dashboard-tab","source":"ui/PremiumMedia.qml","properties":{"name":"premiumMedia","label":"Media+","icon":"music_note"}},
+    {"type":"custom","source":"ThemeSync.qml"}
+  ],
+  "settings": "Settings.qml"
+}
