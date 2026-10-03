@@ -25,6 +25,16 @@ Protected HLS streams are opened through `ani-showtime-player` and `ani-showtime
 
 Showtime is also registered as the default app for common video/HLS MIME types. Its MPRIS interface exposes play/pause and seeking to Caelestia Media+.
 
+### Fullscreen system controls
+
+PremiumMedia does not draw a second fullscreen control surface. Fullscreen playback uses Caelestia's original OSD unchanged, so volume and brightness keep the native shell shape, stacking, icons and slider behavior.
+
+### Stream reliability
+
+The local HLS proxy stays alive for the complete Showtime process lifetime instead of trying to infer idleness from gaps between HLS requests. Upstream playlist, subtitle and segment requests are retried with backoff. Before Showtime opens, the launcher preflights the local HLS master with retries; a known-broken stream therefore fails in the launcher instead of opening Showtime directly on its generic `Unable to play video` screen. A new ani-cli episode also closes any stale Showtime application instance before handing over the new local stream.
+
+HiAnime's current CDN disguises some MPEG-TS segments as `.ts.jpg` by prepending a valid 1×1 PNG plus junk bytes before the real 188-byte TS packet alignment. mpv tolerates that wrapper, but GStreamer's `hlsdemux2` rejects it with an internal data-stream error. The proxy detects the first stable TS sync alignment, strips the fake image wrapper, serves clean `video/mp2t`, and applies client Range requests in the cleaned byte space. Client-side connection cancellations are treated as normal adaptive-stream behavior rather than converted into false 502 errors.
+
 Run `scripts/install-showtime-integration` to install/repair this integration.
 
 ## Theme polish

@@ -26,6 +26,11 @@ import socket
 s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()
 PY
 )"
+# Keep one clean Showtime playback instance per ani-cli launch. This avoids
+# GApplication activation handing the URL to an older window whose bridge may
+# belong to another episode.
+flatpak kill org.gnome.Showtime >/dev/null 2>&1 || true
+
 rundir="${XDG_RUNTIME_DIR:-/run/user/$UID}/ani-showtime"
 mkdir -p "$rundir"
 log="$rundir/${port}.log"
@@ -39,5 +44,14 @@ for _ in $(seq 1 40); do
   sleep .05
 done
 url="http://127.0.0.1:${port}/master.m3u8"
-flatpak run --share=network org.gnome.Showtime --new-window "$url" >/dev/null 2>&1 || true
-wait "$proxy_pid" || true
+
+# Do not open Showtime until the local HLS master is genuinely playable.
+# This turns upstream/referrer failures into a clean launcher error instead of
+# leaving Showtime on its generic “Unable to play video” screen.
+if ! curl -fsS --retry 3 --retry-all-errors --connect-timeout 5 --max-time 20 "$url" >/dev/null; then
+  printf 'ani-showtime: stream preflight failed; Showtime was not opened.
+' >&2
+  exit 1
+fi
+
+flatpak run --share=network org.gnome.Showtime --new-window "$url" >/dev/null 2>&1

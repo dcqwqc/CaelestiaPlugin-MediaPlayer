@@ -46,6 +46,7 @@ Item {
         function onChanged(): void { root.queueApply(); }
     }
 
+
     Timer { id: applyTimer; interval: 120; repeat: false; onTriggered: root.applyTheme() }
     Process { id: themeProc; running: false }
 }

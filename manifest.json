@@ -1,10 +1,10 @@
 {
   "name": "PremiumMedia",
-  "version": "0.3.0",
+  "version": "0.4.1",
   "author": "dcqwqc",
   "homepage": "https://github.com/dcqwqc/CaelestiaPlugin-PremiumMedia",
   "icon": "music_note",
-  "description": "Premium touch-first media for Caelestia with native Showtime ani-cli playback, MPRIS controls, volume/brightness controls and optional palette-synchronised Hyprland chrome.",
+  "description": "Premium touch-first media for Caelestia with native Showtime ani-cli playback, cleaned protected-HLS transport, MPRIS controls and palette-synchronised Hyprland chrome.",
   "entryPoints": [
     {
       "type": "dashboard-tab",
