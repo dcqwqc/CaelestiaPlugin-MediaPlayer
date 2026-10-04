@@ -33,10 +33,27 @@ flatpak kill org.gnome.Showtime >/dev/null 2>&1 || true
 
 rundir="${XDG_RUNTIME_DIR:-/run/user/$UID}/ani-showtime"
 mkdir -p "$rundir"
+
+# Persist playback position per logical title so reopening the same episode/movie
+# resumes where it was closed. MPRIS gives us the actual Showtime position.
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/premium-media/resume"
+mkdir -p "$state_dir"
+state_key="$(printf '%s' "$title" | sha256sum | awk '{print $1}')"
+state_file="$state_dir/${state_key}.pos"
+resume_us=0
+if [[ -r "$state_file" ]]; then
+  saved="$(cat "$state_file" 2>/dev/null || true)"
+  [[ "$saved" =~ ^[0-9]+$ ]] && resume_us="$saved"
+fi
+
 log="$rundir/${port}.log"
 python3 "$root/ani-showtime-proxy.py" --video "$video" --subtitle "$subtitle" --referrer "$referrer" --port "$port" >"$log" 2>&1 &
 proxy_pid=$!
-cleanup(){ kill "$proxy_pid" 2>/dev/null || true; }
+monitor_pid=""
+cleanup(){
+  [[ -n "$monitor_pid" ]] && kill "$monitor_pid" 2>/dev/null || true
+  kill "$proxy_pid" 2>/dev/null || true
+}
 trap cleanup EXIT INT TERM HUP
 for _ in $(seq 1 40); do
   if grep -q '^http://' "$log" 2>/dev/null; then break; fi
@@ -54,4 +71,47 @@ if ! curl -fsS --retry 3 --retry-all-errors --connect-timeout 5 --max-time 20 "$
   exit 1
 fi
 
-flatpak run --share=network org.gnome.Showtime --new-window "$url" >/dev/null 2>&1
+flatpak run --share=network org.gnome.Showtime --new-window "$url" >/dev/null 2>&1 &
+showtime_pid=$!
+
+# Wait until this exact local stream is exposed over Showtime's MPRIS service.
+for _ in $(seq 1 80); do
+  meta="$(busctl --user get-property org.mpris.MediaPlayer2.org.gnome.Showtime /org/mpris/MediaPlayer2 org.mpris.MediaPlayer2.Player Metadata 2>/dev/null || true)"
+  [[ "$meta" == *"$url"* ]] && break
+  sleep .1
+done
+
+# Resume relative to the position Showtime already reached while loading.
+if (( resume_us > 0 )); then
+  current_line="$(busctl --user get-property org.mpris.MediaPlayer2.org.gnome.Showtime /org/mpris/MediaPlayer2 org.mpris.MediaPlayer2.Player Position 2>/dev/null || true)"
+  current_us="${current_line##* }"
+  [[ "$current_us" =~ ^[0-9]+$ ]] || current_us=0
+  delta=$((resume_us-current_us))
+  if (( delta != 0 )); then
+    busctl --user call org.mpris.MediaPlayer2.org.gnome.Showtime /org/mpris/MediaPlayer2 org.mpris.MediaPlayer2.Player Seek x "$delta" >/dev/null 2>&1 || true
+  fi
+fi
+
+# Track the real player position every two seconds. Near the end, clear the
+# state so a completed video starts from the beginning next time.
+(
+  while kill -0 "$showtime_pid" 2>/dev/null; do
+    pos_line="$(busctl --user get-property org.mpris.MediaPlayer2.org.gnome.Showtime /org/mpris/MediaPlayer2 org.mpris.MediaPlayer2.Player Position 2>/dev/null || true)"
+    pos_us="${pos_line##* }"
+    meta="$(busctl --user get-property org.mpris.MediaPlayer2.org.gnome.Showtime /org/mpris/MediaPlayer2 org.mpris.MediaPlayer2.Player Metadata 2>/dev/null || true)"
+    duration_us="$(printf '%s' "$meta" | sed -n 's/.*"mpris:length" x \([0-9][0-9]*\).*/\1/p')"
+    if [[ "$pos_us" =~ ^[0-9]+$ ]]; then
+      if [[ "$duration_us" =~ ^[0-9]+$ ]] && (( duration_us > 0 && pos_us >= duration_us-15000000 )); then
+        rm -f "$state_file"
+      else
+        tmp="${state_file}.tmp.$$"
+        printf '%s\n' "$pos_us" >"$tmp"
+        mv -f "$tmp" "$state_file"
+      fi
+    fi
+    sleep 2
+  done
+) &
+monitor_pid=$!
+
+wait "$showtime_pid" || true

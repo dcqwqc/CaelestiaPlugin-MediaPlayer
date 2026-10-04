@@ -6,6 +6,8 @@ class Proxy:
     def __init__(self, video, subtitle, referrer):
         self.video=video; self.subtitle=subtitle; self.referrer=referrer
         self.video_duration=None
+        self.segment_durations=[]
+        self._subtitle_cues=None
     def req(self,url,range_header=None):
         headers={'Referer':self.referrer,'User-Agent':'Mozilla/5.0'}
         if range_header: headers['Range']=range_header
@@ -42,12 +44,15 @@ class Proxy:
         return data[off:], off
 
     def rewrite_playlist(self,text,base):
-        out=[]; duration=0.0
+        out=[]; duration=0.0; durations=[]
         uri_attr=re.compile(r'URI="([^"]+)"')
         for raw in text.splitlines():
             line=raw.strip()
             if line.startswith('#EXTINF:'):
-                try: duration+=float(line.split(':',1)[1].split(',',1)[0])
+                try:
+                    segdur=float(line.split(':',1)[1].split(',',1)[0])
+                    duration+=segdur
+                    durations.append(segdur)
                 except: pass
             if line.startswith('#'):
                 def repl(m):
@@ -58,8 +63,50 @@ class Proxy:
                 absu=urllib.parse.urljoin(base,line)
                 out.append('/fetch?u='+urllib.parse.quote(absu,safe=''))
             else: out.append(raw)
-        if duration>0: self.video_duration=duration
+        if duration>0:
+            self.video_duration=duration
+            if base == self.video:
+                self.segment_durations=durations
         return '\n'.join(out)+'\n'
+
+    @staticmethod
+    def _vtt_time(value):
+        parts=value.strip().replace(',', '.').split(':')
+        try:
+            if len(parts)==2: return float(parts[0])*60+float(parts[1])
+            if len(parts)==3: return float(parts[0])*3600+float(parts[1])*60+float(parts[2])
+        except ValueError: pass
+        return None
+
+    def subtitle_cues(self):
+        if self._subtitle_cues is not None: return self._subtitle_cues
+        if not self.subtitle:
+            self._subtitle_cues=[]
+            return self._subtitle_cues
+        with self.req(self.subtitle) as resp:
+            text=resp.read().decode('utf-8','replace').replace('\r\n','\n').replace('\r','\n')
+        cues=[]
+        for block in re.split(r'\n{2,}',text.strip()):
+            timing=next((line for line in block.splitlines() if '-->' in line),None)
+            if not timing: continue
+            left,right=timing.split('-->',1)
+            start=self._vtt_time(left.split()[0])
+            end=self._vtt_time(right.strip().split()[0])
+            if start is not None and end is not None:
+                cues.append((start,end,block))
+        self._subtitle_cues=cues
+        return cues
+
+    def subtitle_segment(self,index):
+        durations=self.segment_durations or ([self.video_duration] if self.video_duration else [3600.0])
+        if index<0 or index>=len(durations): return None
+        start=sum(durations[:index])
+        end=start+durations[index]
+        blocks=[block for cue_start,cue_end,block in self.subtitle_cues() if cue_start<end and cue_end>start]
+        body='WEBVTT\n\n'
+        if blocks:
+            body+='\n\n'.join(blocks)+'\n\n'
+        return body.encode('utf-8')
 
 
 def make_handler(proxy):
@@ -67,18 +114,20 @@ def make_handler(proxy):
         protocol_version='HTTP/1.1'
         def log_message(self,*a): pass
         def send_bytes(self,data,ctype,status=200,extra=None):
+            if status==200:
+                data,status,range_extra=self.apply_range(data,self.headers.get('Range'))
+                extra={**range_extra, **(extra or {})}
             try:
                 self.send_response(status)
                 self.send_header('Content-Type',ctype)
                 self.send_header('Content-Length',str(len(data)))
+                self.send_header('Accept-Ranges','bytes')
                 self.send_header('Cache-Control','no-store')
                 if extra:
                     for k,v in extra.items(): self.send_header(k,v)
                 self.end_headers()
-                self.wfile.write(data)
+                if self.command!='HEAD': self.wfile.write(data)
             except (BrokenPipeError, ConnectionResetError):
-                # Adaptive demuxers routinely cancel an in-flight segment when
-                # seeking/rebuffering. That is not an upstream/proxy failure.
                 return
 
         @staticmethod
@@ -101,6 +150,9 @@ def make_handler(proxy):
                 }
             except Exception:
                 return data, 200, {}
+        def do_HEAD(self):
+            self.do_GET()
+
         def do_GET(self):
             u=urllib.parse.urlparse(self.path)
             if u.path=='/master.m3u8':
@@ -120,11 +172,19 @@ def make_handler(proxy):
                 with proxy.req(proxy.video) as resp: txt=resp.read().decode('utf-8','replace')
                 data=proxy.rewrite_playlist(txt,proxy.video).encode(); self.send_bytes(data,'application/vnd.apple.mpegurl'); return
             if u.path=='/subs.m3u8' and proxy.subtitle:
-                dur=proxy.video_duration or 3600.0; target=max(1,math.ceil(dur))
-                txt=f'#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-TARGETDURATION:{target}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:{dur:.3f},\n/sub.vtt\n#EXT-X-ENDLIST\n'
-                self.send_bytes(txt.encode(),'application/vnd.apple.mpegurl'); return
+                durations=proxy.segment_durations or ([proxy.video_duration] if proxy.video_duration else [3600.0])
+                target=max(1,math.ceil(max(durations)))
+                lines=['#EXTM3U','#EXT-X-VERSION:3','#EXT-X-PLAYLIST-TYPE:VOD',f'#EXT-X-TARGETDURATION:{target}','#EXT-X-MEDIA-SEQUENCE:0']
+                for i,dur in enumerate(durations):
+                    lines.extend((f'#EXTINF:{dur:.6f},',f'/sub.vtt?i={i}'))
+                lines.append('#EXT-X-ENDLIST')
+                self.send_bytes(('\n'.join(lines)+'\n').encode(),'application/vnd.apple.mpegurl'); return
             if u.path=='/sub.vtt' and proxy.subtitle:
-                with proxy.req(proxy.subtitle) as resp: data=resp.read()
+                try: index=int((urllib.parse.parse_qs(u.query).get('i') or ['0'])[0])
+                except ValueError: index=0
+                data=proxy.subtitle_segment(index)
+                if data is None:
+                    self.send_error(404); return
                 self.send_bytes(data,'text/vtt; charset=utf-8'); return
             if u.path=='/fetch':
                 q=urllib.parse.parse_qs(u.query); target=(q.get('u') or [''])[0]
@@ -146,8 +206,7 @@ def make_handler(proxy):
                     if stripped is not None:
                         data=clean; ctype='video/mp2t'
 
-                    ranged,status,extra=self.apply_range(data,self.headers.get('Range'))
-                    self.send_bytes(ranged,ctype,status,extra)
+                    self.send_bytes(data,ctype)
                 except (BrokenPipeError, ConnectionResetError):
                     return
                 except Exception as e:
