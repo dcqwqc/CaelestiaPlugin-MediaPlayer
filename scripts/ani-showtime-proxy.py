@@ -103,7 +103,8 @@ class Proxy:
         start=sum(durations[:index])
         end=start+durations[index]
         blocks=[block for cue_start,cue_end,block in self.subtitle_cues() if cue_start<end and cue_end>start]
-        body='WEBVTT\n\n'
+        mpegts=max(0,round(start*90000))
+        body=f'WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:{mpegts}\n\n'
         if blocks:
             body+='\n\n'.join(blocks)+'\n\n'
         return body.encode('utf-8')
@@ -160,17 +161,20 @@ def make_handler(proxy):
                 with proxy.req(proxy.video) as resp:
                     txt=resp.read().decode('utf-8','replace')
                 proxy.rewrite_playlist(txt,proxy.video)
+                # Keep the video HLS presentation simple. Showtime receives
+                # external WebVTT through GstPlay.suburi, which is its native
+                # subtitle path and exposes the normal subtitle menu/renderer.
                 lines=['#EXTM3U','#EXT-X-VERSION:3']
-                if proxy.subtitle:
-                    lines.append('#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,URI="/subs.m3u8"')
-                    lines.append('#EXT-X-STREAM-INF:BANDWIDTH=8000000,RESOLUTION=1920x1080,SUBTITLES="subs"')
-                else:
-                    lines.append('#EXT-X-STREAM-INF:BANDWIDTH=8000000,RESOLUTION=1920x1080')
+                lines.append('#EXT-X-STREAM-INF:BANDWIDTH=8000000,RESOLUTION=1920x1080')
                 lines.append('/video.m3u8')
                 self.send_bytes(('\n'.join(lines)+'\n').encode(),'application/vnd.apple.mpegurl'); return
             if u.path=='/video.m3u8':
                 with proxy.req(proxy.video) as resp: txt=resp.read().decode('utf-8','replace')
                 data=proxy.rewrite_playlist(txt,proxy.video).encode(); self.send_bytes(data,'application/vnd.apple.mpegurl'); return
+            if u.path=='/subtitle.vtt' and proxy.subtitle:
+                with proxy.req(proxy.subtitle) as resp:
+                    data=resp.read()
+                self.send_bytes(data,'text/vtt; charset=utf-8'); return
             if u.path=='/subs.m3u8' and proxy.subtitle:
                 durations=proxy.segment_durations or ([proxy.video_duration] if proxy.video_duration else [3600.0])
                 target=max(1,math.ceil(max(durations)))

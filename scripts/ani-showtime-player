@@ -7,7 +7,7 @@ title="${4:-Anime}"
 
 # Remote/agent shells may not inherit the graphical session environment.
 # Recover it from the running Caelestia shell so Showtime can still launch.
-if [[ -z "${WAYLAND_DISPLAY:-}" || -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+if [[ -z "${WAYLAND_DISPLAY:-}" || -z "${DBUS_SESSION_BUS_ADDRESS:-}" || -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
   shell_pid="$(systemctl --user show -p MainPID --value caelestia-shell.service 2>/dev/null || true)"
   if [[ -n "$shell_pid" && "$shell_pid" != "0" && -r "/proc/$shell_pid/environ" ]]; then
     while IFS= read -r -d '' kv; do
@@ -71,7 +71,22 @@ if ! curl -fsS --retry 3 --retry-all-errors --connect-timeout 5 --max-time 20 "$
   exit 1
 fi
 
-flatpak run --share=network org.gnome.Showtime --new-window "$url" >/dev/null 2>&1 &
+subtitle_local=""
+if [[ -n "$subtitle" ]]; then
+  subtitle_local="http://127.0.0.1:${port}/subtitle.vtt"
+fi
+
+showtime_log="$rundir/${port}-showtime.log"
+flatpak_args=(
+  run
+  --share=network
+  --filesystem="$root:ro"
+  --command=python3
+)
+if [[ -n "$subtitle_local" ]]; then
+  flatpak_args+=(--env="PREMIUM_MEDIA_SUBTITLE_URI=$subtitle_local")
+fi
+flatpak "${flatpak_args[@]}" org.gnome.Showtime "$root/showtime-premium.py" --new-window "$url" >"$showtime_log" 2>&1 &
 showtime_pid=$!
 
 # Wait until this exact local stream is exposed over Showtime's MPRIS service.
@@ -80,6 +95,19 @@ for _ in $(seq 1 80); do
   [[ "$meta" == *"$url"* ]] && break
   sleep .1
 done
+
+# Fullscreen the Showtime window by selector so remote launches do not depend
+# on which app happened to own keyboard focus.
+if [[ "${ANI_SHOWTIME_FULLSCREEN:-1}" != "0" ]]; then
+  for _ in $(seq 1 30); do
+    showtime_addr="$(hyprctl -j clients 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); ws=[w for w in d if w.get("class")=="org.gnome.Showtime"]; print(max(ws,key=lambda w:int(w.get("pid",0))).get("address","") if ws else "")' 2>/dev/null || true)"
+    if [[ "$showtime_addr" =~ ^0x[0-9a-fA-F]+$ ]]; then
+      hyprctl dispatch "hl.dsp.window.fullscreen({window=\"address:$showtime_addr\",mode=\"fullscreen\",action=\"set\"})" >/dev/null 2>&1 || true
+      break
+    fi
+    sleep .1
+  done
+fi
 
 # Resume relative to the position Showtime already reached while loading.
 if (( resume_us > 0 )); then
