@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""PremiumMedia launcher for GNOME Showtime with automatic external subtitles."""
+"""Media Player launcher for GNOME Showtime with automatic external subtitles."""
 
 import gettext
 import locale
@@ -40,7 +40,7 @@ _original_play_video = Window.play_video
 
 
 def _premium_play_video(self, gfile):
-    subtitle_uri = os.environ.get("PREMIUM_MEDIA_SUBTITLE_URI", "").strip()
+    subtitle_uri = os.environ.get("MEDIA_PLAYER_SUBTITLE_URI", "").strip()
 
     # GstPlay's native external subtitle input. Set it before the video URI so
     # discovery includes the subtitle stream from the beginning.
@@ -48,7 +48,7 @@ def _premium_play_video(self, gfile):
         try:
             self.play.props.suburi = subtitle_uri
         except Exception as exc:
-            print(f"PremiumMedia: failed to set subtitle URI: {exc}", file=sys.stderr)
+            print(f"MediaPlayer: failed to set subtitle URI: {exc}", file=sys.stderr)
 
     _original_play_video(self, gfile)
 
@@ -61,7 +61,7 @@ def _premium_play_video(self, gfile):
                 self.play.props.suburi = subtitle_uri
                 self.select_subtitles(0)
             except Exception as exc:
-                print(f"PremiumMedia: failed to enable subtitles: {exc}", file=sys.stderr)
+                print(f"MediaPlayer: failed to enable subtitles: {exc}", file=sys.stderr)
             return GLib.SOURCE_REMOVE
 
         GLib.timeout_add(250, enable_subtitles)

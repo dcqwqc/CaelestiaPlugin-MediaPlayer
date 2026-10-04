@@ -36,10 +36,15 @@ mkdir -p "$rundir"
 
 # Persist playback position per logical title so reopening the same episode/movie
 # resumes where it was closed. MPRIS gives us the actual Showtime position.
-state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/premium-media/resume"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/media-player/resume"
+legacy_state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/premium-media/resume"
 mkdir -p "$state_dir"
 state_key="$(printf '%s' "$title" | sha256sum | awk '{print $1}')"
 state_file="$state_dir/${state_key}.pos"
+legacy_state_file="$legacy_state_dir/${state_key}.pos"
+if [[ ! -e "$state_file" && -r "$legacy_state_file" ]]; then
+  cp -f "$legacy_state_file" "$state_file" 2>/dev/null || true
+fi
 resume_us=0
 if [[ -r "$state_file" ]]; then
   saved="$(cat "$state_file" 2>/dev/null || true)"
@@ -84,9 +89,9 @@ flatpak_args=(
   --command=python3
 )
 if [[ -n "$subtitle_local" ]]; then
-  flatpak_args+=(--env="PREMIUM_MEDIA_SUBTITLE_URI=$subtitle_local")
+  flatpak_args+=(--env="MEDIA_PLAYER_SUBTITLE_URI=$subtitle_local")
 fi
-flatpak "${flatpak_args[@]}" org.gnome.Showtime "$root/showtime-premium.py" --new-window "$url" >"$showtime_log" 2>&1 &
+flatpak "${flatpak_args[@]}" org.gnome.Showtime "$root/showtime-player.py" --new-window "$url" >"$showtime_log" 2>&1 &
 showtime_pid=$!
 
 # Wait until this exact local stream is exposed over Showtime's MPRIS service.

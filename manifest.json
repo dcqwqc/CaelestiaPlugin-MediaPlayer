@@ -1,24 +1,9 @@
 {
-  "name": "PremiumMedia",
-  "version": "0.4.1",
+  "name": "MediaPlayer",
+  "version": "0.5.0",
   "author": "dcqwqc",
-  "homepage": "https://github.com/dcqwqc/CaelestiaPlugin-PremiumMedia",
-  "icon": "music_note",
-  "description": "Premium touch-first media for Caelestia with native Showtime ani-cli playback, cleaned protected-HLS transport, MPRIS controls and palette-synchronised Hyprland chrome.",
-  "entryPoints": [
-    {
-      "type": "dashboard-tab",
-      "source": "ui/PremiumMedia.qml",
-      "properties": {
-        "name": "premiumMedia",
-        "label": "Media+",
-        "icon": "music_note"
-      }
-    },
-    {
-      "type": "custom",
-      "source": "ThemeSync.qml"
-    }
-  ],
-  "settings": "Settings.qml"
+  "homepage": "https://github.com/dcqwqc/CaelestiaPlugin-MediaPlayer",
+  "icon": "movie",
+  "description": "Customized GNOME Showtime media player integration for Caelestia and ani-cli with native subtitles, seeking, resume, fullscreen and protected-HLS support.",
+  "entryPoints": []
 }
