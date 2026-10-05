@@ -92,6 +92,7 @@ class Proxy:
         self.prepared={}
         self.resolve_events={}
         self.ai_processes={}
+        self.study_processes={}
         self.revisions={}
         self.chapters=[]
         self.chapter_status='idle'
@@ -195,6 +196,49 @@ class Proxy:
         except Exception:
             return {'status':'idle','error':None}
 
+    @staticmethod
+    def _is_japanese_track(track):
+        label=str(track.get('language') or track.get('label') or '').lower()
+        return any(x in label for x in ('japanese','日本語',' ja ','[ja]')) or label.strip() in ('ja','jp')
+
+    def _japanese_original(self,payload=None):
+        tracks=(payload or {}).get('subtitle_tracks') if payload is not None else self.subtitle_tracks
+        return next((x for x in (tracks or []) if self._is_japanese_track(x)),None)
+
+    def study_path(self,natural_track_id,episode=None,anime_id=None):
+        logical=f'{anime_id or self.anime_id}:{episode or self.episode}'
+        key=hashlib.sha256(logical.encode()).hexdigest()[:24]
+        safe=re.sub(r'[^A-Za-z0-9_.-]+','_',natural_track_id)
+        return self.subtitle_cache/key/f'study-ja-{safe}.json'
+
+    def study_status(self,natural_track_id,episode=None,anime_id=None):
+        path=self.study_path(natural_track_id,episode,anime_id)
+        if path.exists(): return {'status':'ready','error':None}
+        status_path=path.with_suffix('.status.json')
+        try:
+            value=json.loads(status_path.read_text())
+            return value if isinstance(value,dict) else {'status':'idle','error':None}
+        except Exception:
+            return {'status':'idle','error':None}
+
+    def study_tracks(self):
+        tracks=[]
+        for track in self.subtitle_tracks:
+            if self._is_japanese_track(track):
+                continue
+            track_id=str(track.get('id') or '')
+            if not track_id: continue
+            state=self.study_status(track_id)
+            language=str(track.get('language') or 'Original')
+            tracks.append({
+                'id':f'study-ja-{track_id}','source':'study','natural_track_id':track_id,
+                'label':f'Japanese Study · {language}','language':language,
+                'available':self.study_path(track_id).exists(),
+                'status':state.get('status','idle'),'error':state.get('error'),
+                'japanese_source':'Original Japanese' if self._japanese_original() else 'Qwen3-ASR Japanese fallback',
+            })
+        return tracks
+
     def subtitle_catalog(self):
         tracks=[dict(x,url=None) for x in self.subtitle_tracks]
         for lang,label in GENERATED_LANGUAGES:
@@ -206,6 +250,7 @@ class Proxy:
                 'available':path.exists(),'status':state.get('status','idle'),
                 'error':state.get('error'),'url':None,
             })
+        tracks.extend(self.study_tracks())
         return tracks
 
     def _snapshot(self):
@@ -254,13 +299,15 @@ class Proxy:
         with self.session_lock:
             rev=self.revision
             selected=self.selected_subtitle_id
-            subtitle_url=None if selected=='off' else f'{self.base_url}/api/subtitles/{urllib.parse.quote(selected)}.vtt?rev={rev}'
+            is_study=selected.startswith('study-ja-')
+            subtitle_url=None if selected=='off' or is_study else f'{self.base_url}/api/subtitles/{urllib.parse.quote(selected)}.vtt?rev={rev}'
+            study_url=(f'{self.base_url}/api/study/{urllib.parse.quote(selected)}.json?rev={rev}' if is_study else None)
             return {
                 'anime_id':self.anime_id,'anime_title':self.anime_title,'episode':self.episode,
                 'previous_episode':self.adjacent(-1),'next_episode':self.adjacent(1),
                 'mal_id':self.mal_id,'mode':self.mode,'quality':self.quality,'revision':rev,
                 'media_url':f'{self.base_url}/master.m3u8?rev={rev}',
-                'subtitle_url':subtitle_url,'selected_subtitle_id':selected,
+                'subtitle_url':subtitle_url,'study_url':study_url,'selected_subtitle_id':selected,
                 'subtitles':self.subtitle_catalog(),'chapters':list(self.chapters),
                 'prepared_episodes':sorted(self.prepared),'resume_us':self.resume_us(),
                 'pending_subtitle_id':self.pending_subtitle_id,
@@ -475,7 +522,7 @@ class Proxy:
             self.pending_subtitle_id=None
         return self.session_json()
 
-    def start_generation(self,track_id):
+    def start_generation(self,track_id,select_when_ready=True):
         if not track_id.startswith('generated-'):
             raise RuntimeError('not an AI subtitle track')
         lang=track_id.removeprefix('generated-')
@@ -495,15 +542,17 @@ class Proxy:
         job_key=(anime_id,episode,lang)
 
         if path.exists():
-            with self.session_lock:
-                if self.anime_id==anime_id and self.episode==episode:
-                    self.selected_subtitle_id=track_id
+            if select_when_ready:
+                with self.session_lock:
+                    if self.anime_id==anime_id and self.episode==episode:
+                        self.selected_subtitle_id=track_id
             return self.session_json()
 
         with self.session_lock:
             running=self.ai_processes.get(job_key)
             if running is not None and running.poll() is None:
-                self.pending_subtitle_id=track_id
+                if select_when_ready:
+                    self.pending_subtitle_id=track_id
                 return self.session_json()
 
         env_python=Path.home()/'.local/share/media-player/ai-env/bin/python'
@@ -543,7 +592,8 @@ class Proxy:
         )
         with self.session_lock:
             self.ai_processes[job_key]=proc
-            self.pending_subtitle_id=track_id
+            if select_when_ready:
+                self.pending_subtitle_id=track_id
 
         def monitor():
             code=proc.wait()
@@ -555,6 +605,7 @@ class Proxy:
                     and path.exists()
                     and self.anime_id==anime_id
                     and self.episode==episode
+                    and select_when_ready
                     and self.pending_subtitle_id==track_id
                 )
                 if should_select:
@@ -563,6 +614,110 @@ class Proxy:
                 elif self.pending_subtitle_id==track_id:
                     self.pending_subtitle_id=None
         threading.Thread(target=monitor,daemon=True).start()
+        return self.session_json()
+
+    def study_bytes(self,track_id,revision=None):
+        snapshot=self.revision_payload(revision)
+        if not snapshot or not track_id.startswith('study-ja-original-'):
+            return None
+        natural_id=track_id.removeprefix('study-ja-')
+        path=self.study_path(natural_id,snapshot.get('episode'),snapshot.get('anime_id'))
+        return path.read_bytes() if path.exists() else None
+
+    def start_study(self,track_id):
+        if not track_id.startswith('study-ja-original-'):
+            raise RuntimeError('not a Japanese study subtitle track')
+        natural_id=track_id.removeprefix('study-ja-')
+        with self.session_lock:
+            revision=int(self.revision)
+            snapshot=self.revision_payload(revision)
+        if not snapshot:
+            raise RuntimeError('episode revision no longer available')
+        natural_track=next((x for x in snapshot.get('subtitle_tracks',[]) if x.get('id')==natural_id),None)
+        if not natural_track:
+            raise RuntimeError('original translation track not found')
+        if self._is_japanese_track(natural_track):
+            raise RuntimeError('choose a non-Japanese original track for the natural translation')
+
+        episode=str(snapshot.get('episode') or '')
+        anime_id=str(snapshot.get('anime_id') or self.anime_id)
+        path=self.study_path(natural_id,episode,anime_id)
+        status_path=path.with_suffix('.status.json')
+        job_key=(anime_id,episode,natural_id)
+        if path.exists():
+            with self.session_lock:
+                if self.anime_id==anime_id and self.episode==episode:
+                    self.selected_subtitle_id=track_id; self.pending_subtitle_id=None
+            return self.session_json()
+        with self.session_lock:
+            running=self.study_processes.get(job_key)
+            if running and running.is_alive():
+                self.pending_subtitle_id=track_id
+                return self.session_json()
+            self.pending_subtitle_id=track_id
+
+        path.parent.mkdir(parents=True,exist_ok=True)
+        status_path.write_text(json.dumps({'status':'starting','error':None}))
+
+        def worker():
+            error=None
+            try:
+                env_python=Path.home()/'.local/share/media-player/ai-env/bin/python'
+                if not env_python.exists(): raise RuntimeError('AI subtitle environment is not installed')
+                japanese_track=self._japanese_original(snapshot)
+                japanese_source='Original AniCLI Japanese'
+                jp_file=path.parent/f'study-source-ja-{revision}.vtt'
+                natural_file=path.parent/f'study-natural-{natural_id}-{revision}.vtt'
+
+                status_path.write_text(json.dumps({'status':'preparing-japanese','error':None}))
+                if japanese_track:
+                    with self.req(japanese_track['url'],referrer=snapshot.get('referrer')) as resp:
+                        jp_file.write_bytes(resp.read())
+                else:
+                    japanese_source='Qwen3-ASR 1.7B Japanese fallback'
+                    ja_path=self.generated_path('ja',episode,anime_id)
+                    if not ja_path.exists():
+                        self.start_generation('generated-ja',select_when_ready=False)
+                        deadline=time.monotonic()+1800
+                        while time.monotonic()<deadline and not ja_path.exists():
+                            state=self.generated_status('ja',episode,anime_id)
+                            if state.get('status')=='error':
+                                raise RuntimeError(state.get('error') or 'Japanese transcription failed')
+                            time.sleep(.5)
+                        if not ja_path.exists(): raise RuntimeError('Japanese transcription timed out')
+                    jp_file.write_bytes(ja_path.read_bytes())
+
+                status_path.write_text(json.dumps({'status':'analyzing','error':None}))
+                with self.req(natural_track['url'],referrer=snapshot.get('referrer')) as resp:
+                    natural_file.write_bytes(resp.read())
+                cmd=[
+                    str(env_python),str(self.root/'study-subtitles.py'),
+                    '--japanese-vtt',str(jp_file),'--natural-vtt',str(natural_file),
+                    '--output',str(path),'--natural-language',str(natural_track.get('language') or 'Original'),
+                    '--japanese-source',japanese_source,
+                ]
+                subprocess.run(cmd,check=True,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=180)
+                status_path.write_text(json.dumps({'status':'ready','error':None}))
+            except Exception as exc:
+                error=str(exc)
+                status_path.write_text(json.dumps({'status':'error','error':error}))
+            finally:
+                for source in path.parent.glob(f'study-*-{revision}.vtt'):
+                    source.unlink(missing_ok=True)
+                with self.session_lock:
+                    self.study_processes.pop(job_key,None)
+                    if (
+                        error is None and path.exists()
+                        and self.anime_id==anime_id and self.episode==episode
+                        and self.pending_subtitle_id==track_id
+                    ):
+                        self.selected_subtitle_id=track_id; self.pending_subtitle_id=None
+                    elif self.pending_subtitle_id==track_id:
+                        self.pending_subtitle_id=None
+
+        thread=threading.Thread(target=worker,daemon=True,name=f'study-{episode}-{natural_id}')
+        with self.session_lock: self.study_processes[job_key]=thread
+        thread.start()
         return self.session_json()
 
     def resume_path(self,payload=None):
@@ -878,6 +1033,9 @@ def make_handler(proxy):
                 if u.path=='/api/subtitles/generate':
                     body=self.read_json()
                     self.send_json(proxy.start_generation(str(body.get('id') or ''))); return
+                if u.path=='/api/study/generate':
+                    body=self.read_json()
+                    self.send_json(proxy.start_study(str(body.get('id') or ''))); return
                 if u.path=='/api/progress':
                     body=self.read_json()
                     self.send_json(proxy.update_progress(
@@ -913,6 +1071,15 @@ def make_handler(proxy):
                 if data is None:
                     self.send_error(404); return
                 self.send_bytes(data,'text/vtt; charset=utf-8'); return
+            if u.path.startswith('/api/study/') and u.path.endswith('.json'):
+                track_id=urllib.parse.unquote(u.path[len('/api/study/'):-5])
+                revision=requested_revision()
+                if revision is None:
+                    self.send_error(400); return
+                data=proxy.study_bytes(track_id,revision)
+                if data is None:
+                    self.send_error(404); return
+                self.send_bytes(data,'application/json; charset=utf-8'); return
 
             if u.path in ('/master.m3u8','/video.m3u8'):
                 revision=requested_revision()
