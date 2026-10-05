@@ -41,6 +41,7 @@ def test_non_media_blob_is_left_alone():
     assert stripped is None
 
 
+
 if __name__ == '__main__':
     for name in sorted(n for n in globals() if n.startswith('test_')):
         globals()[name]()

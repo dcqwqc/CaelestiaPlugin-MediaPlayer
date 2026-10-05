@@ -1,21 +1,44 @@
 #!/usr/bin/env bash
 set -euo pipefail
-self="$(readlink -f -- "${BASH_SOURCE[0]}")"
-root="$(cd -- "$(dirname -- "$self")" && pwd)"
-src=/usr/bin/ani-cli
+script_path="$(readlink -f -- "${BASH_SOURCE[0]}")"
+root="$(cd -- "$(dirname -- "$script_path")" && pwd)"
+src="${ANI_CLI_UPSTREAM:-/usr/bin/ani-cli}"
 cache="${XDG_CACHE_HOME:-$HOME/.cache}/ani-cli-showtime"
 mkdir -p "$cache"
-hash="$(sha256sum "$src" | awk '{print $1}')"
+upstream_hash="$(sha256sum "$src" | awk '{print $1}')"
+patch_hash="$(sha256sum "$script_path" | awk '{print $1}')"
+hash="$(printf '%s\n%s\n' "$upstream_hash" "$patch_hash" | sha256sum | awk '{print $1}')"
 if [[ ! -x "$cache/ani-cli" || ! -f "$cache/source.sha256" || "$(cat "$cache/source.sha256")" != "$hash" ]]; then
   python3 - "$src" "$cache/ani-cli" <<'PY'
 from pathlib import Path
 import sys
-src=Path(sys.argv[1]).read_text()
-needle='        *flatpak*mpv*) flatpak run io.mpv.Mpv --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 & ;;'
-insert='        *showtime*) nohup $player_function "$video_link" "$refr" "$sub_link" "${anime_title} Episode ${ep_no}" >/dev/null 2>&1 & ;;\n'+needle
-if needle not in src:
-    raise SystemExit('ani-cli player dispatch changed; refusing to apply stale Showtime patch')
-src=src.replace(needle,insert,1)
+
+src = Path(sys.argv[1]).read_text()
+
+player_needle = '''        *flatpak*mpv*) flatpak run io.mpv.Mpv --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 & ;;'''
+player_insert = '        *showtime*) ANI_SHOWTIME_ANIME_ID="$anime_id" ANI_SHOWTIME_ANIME_TITLE="$anime_title" ANI_SHOWTIME_EPISODE="$ep_no" ANI_SHOWTIME_EPISODE_LIST="$ep_list" ANI_SHOWTIME_MAL_ID="$mal_id" ANI_SHOWTIME_MODE="$mode" ANI_SHOWTIME_QUALITY="$quality" ANI_SHOWTIME_SUBTITLE_CATALOG="$sub_catalog_json" nohup $player_function "$video_link" "$refr" "$sub_link" "${anime_title} Episode ${ep_no}" >/dev/null 2>&1 & if [ -n "${ANI_SHOWTIME_HANDOFF_URL:-}" ]; then player_pid=$!; wait "$player_pid"; exit $?; fi ;;\n' + player_needle
+if player_needle not in src:
+    raise SystemExit("ani-cli player dispatch changed; refusing stale Showtime patch")
+src = src.replace(player_needle, player_insert, 1)
+
+sub_needle = '''    sub_link="$(printf "%s" "$_json" | sed 's|.*"subtitles":\\[||; s|\\].*||; s|},{|}\\n{|g' | grep -m 1 '"default":true' | sed -nE 's|.*"src":"([^\"]*)".*|\\1|p')"'''
+sub_insert = sub_needle + '''\n    sub_catalog_json="$(printf "%s" "$_json" | sed -nE 's|.*"subtitles":(\\[[^]]*\\]).*|\\1|p')"'''
+if sub_needle not in src:
+    raise SystemExit("ani-cli subtitle parser changed; refusing stale Showtime patch")
+src = src.replace(sub_needle, sub_insert, 1)
+
+select_needle = '''        [ "$index" -eq "$index" ] 2>/dev/null && result=$(printf "%s" "$anime_list" | sed -n "${index}p")
+        [ -z "$index" ] && result=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: ")'''
+select_insert = '''        if [ -n "${ANI_SHOWTIME_FORCE_ANIME_ID:-}" ]; then
+            result=$(printf "%s" "$anime_list" | awk -F '\\t' -v id="$ANI_SHOWTIME_FORCE_ANIME_ID" '$1 == id { print; exit }')
+        else
+            [ "$index" -eq "$index" ] 2>/dev/null && result=$(printf "%s" "$anime_list" | sed -n "${index}p")
+            [ -z "$index" ] && result=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: ")
+        fi'''
+if select_needle not in src:
+    raise SystemExit("ani-cli search selection changed; refusing stale Showtime patch")
+src = src.replace(select_needle, select_insert, 1)
+
 Path(sys.argv[2]).write_text(src)
 PY
   chmod +x "$cache/ani-cli"
