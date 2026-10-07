@@ -103,3 +103,47 @@ def test_ai_extract_audio_passes_headers_to_ffmpeg():
     header_value = cmd[cmd.index("-headers") + 1]
     assert "Referer: https://example.invalid/\r\n" in header_value
     assert "Authorization: Bearer secret\r\n" in header_value
+
+
+def test_loadfile_refreshes_per_episode_headers():
+    m = load_shim()
+    b = m.Bridge({
+        "url": "https://example.invalid/a.m3u8",
+        "title": "Episode A",
+        "referrer": "https://old.example/",
+        "http_headers": ["Origin: https://old.example"],
+    })
+    b.handle_command([
+        "loadfile",
+        "https://example.invalid/b.m3u8",
+        "replace",
+        -1,
+        {
+            "referrer": "https://new.example/",
+            "user-agent": "KunaiTest/1",
+            "http-header-fields": "Origin: https://new.example,Authorization: Bearer next",
+        },
+    ])
+    assert b.referrer == "https://new.example/"
+    assert "Referer: https://new.example/" in b.http_headers
+    assert "User-Agent: KunaiTest/1" in b.http_headers
+    assert "Origin: https://new.example" in b.http_headers
+    assert "Authorization: Bearer next" in b.http_headers
+    assert all("old.example" not in value for value in b.http_headers)
+
+
+def test_subtitle_ids_remain_stable_across_removals_and_sid_off():
+    m = load_shim()
+    b = m.Bridge({"url": "https://example.invalid/a.m3u8", "title": "Demo"})
+    first = b.add_subtitle("https://example.invalid/en.vtt", "English", "en", selected=True)
+    second = b.add_subtitle("https://example.invalid/de.vtt", "German", "de")
+    assert first["mpv_id"] == 1
+    assert second["mpv_id"] == 2
+
+    b.handle_command(["sub-remove", 1])
+    assert [track["mpv_id"] for track in b.subtitles] == [2]
+    b.handle_command(["set_property", "sid", 2])
+    assert b.subtitle.endswith("de.vtt")
+    b.handle_command(["set_property", "sid", "no"])
+    assert b.subtitle is None
+    assert b.selected_subtitle_id == "off"

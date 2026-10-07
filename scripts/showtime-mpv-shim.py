@@ -214,6 +214,7 @@ class Bridge:
             "user-data/kunai-track-changed": "",
         }
         self.subtitles = []
+        self.next_subtitle_mpv_id = 1
         self.subtitle_cache = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "media-player" / "subtitles"
         self.subtitle_cache.mkdir(parents=True, exist_ok=True)
         self.ai_processes = {}
@@ -259,11 +260,13 @@ class Bridge:
                     self.subtitle = url
                     self.selected_subtitle_id = existing["id"]
                 return existing
-            idx = len(self.subtitles) + 1
+            mpv_id = self.next_subtitle_mpv_id
+            self.next_subtitle_mpv_id += 1
             item = {
-                "id": f"mpv-{idx}",
+                "id": f"mpv-{mpv_id}",
+                "mpv_id": mpv_id,
                 "url": url,
-                "label": label or language or f"Subtitle {idx}",
+                "label": label or language or f"Subtitle {mpv_id}",
                 "language": language or "",
                 "source": "original",
                 "available": True,
@@ -273,8 +276,15 @@ class Bridge:
                 self.subtitle = url
                 self.selected_subtitle_id = item["id"]
             self.properties["track-list"] = [
-                {"id": i + 1, "type": "sub", "title": s["label"], "lang": s["language"], "external": True, "selected": s["id"] == getattr(self, "selected_subtitle_id", "")}
-                for i, s in enumerate(self.subtitles)
+                {
+                    "id": track["mpv_id"],
+                    "type": "sub",
+                    "title": track["label"],
+                    "lang": track["language"],
+                    "external": True,
+                    "selected": track["id"] == getattr(self, "selected_subtitle_id", ""),
+                }
+                for track in self.subtitles
             ]
             return item
 
@@ -482,6 +492,21 @@ class Bridge:
 
     def set_media(self, url, options=None):
         options = options or {}
+        new_headers = []
+        referrer = str(options.get("referrer") or "").strip()
+        user_agent = str(options.get("user-agent") or "").strip()
+        header_fields = str(options.get("http-header-fields") or "").strip()
+        if referrer:
+            self.referrer = referrer
+            new_headers.append("Referer: " + referrer)
+        elif self.referrer:
+            new_headers.append("Referer: " + self.referrer)
+        if user_agent:
+            new_headers.append("User-Agent: " + user_agent)
+        if header_fields:
+            new_headers.extend(x.strip() for x in header_fields.split(",") if x.strip())
+        self.referrer = referrer
+        self.http_headers = new_headers
         with self.cond:
             self.url = str(url)
             self.position = float(options.get("start") or 0)
@@ -542,6 +567,32 @@ class Bridge:
                 self.chapters = parse_ffmeta(str(value or ""))
                 with self.lock:
                     self.revision += 1
+            elif name == "sid":
+                if str(value).lower() in ("no", "none", "off", "0"):
+                    self.subtitle = None
+                    self.selected_subtitle_id = "off"
+                else:
+                    try:
+                        mpv_id = int(value)
+                    except (TypeError, ValueError):
+                        mpv_id = -1
+                    track = next((item for item in self.subtitles if item.get("mpv_id") == mpv_id), None)
+                    if track:
+                        self.subtitle = track["url"]
+                        self.selected_subtitle_id = track["id"]
+            elif name == "referrer":
+                self.referrer = str(value or "")
+                self.http_headers = [h for h in self.http_headers if not str(h).lower().startswith(("referer:", "referrer:"))]
+                if self.referrer:
+                    self.http_headers.append("Referer: " + self.referrer)
+            elif name == "http-header-fields":
+                preserved = [h for h in self.http_headers if str(h).lower().startswith(("referer:", "referrer:", "user-agent:"))]
+                preserved.extend(x.strip() for x in str(value or "").split(",") if x.strip())
+                self.http_headers = preserved
+            elif name == "user-agent":
+                self.http_headers = [h for h in self.http_headers if not str(h).lower().startswith("user-agent:")]
+                if value:
+                    self.http_headers.append("User-Agent: " + str(value))
             elif name == "user-data/kunai-can-next":
                 self.can_next = bool(value)
             elif name == "user-data/kunai-can-previous":
@@ -579,6 +630,22 @@ class Bridge:
             self.prop("track-list", self.properties["track-list"])
             return item.get("id")
         if op == "sub-remove":
+            try:
+                mpv_id = int(command[1]) if len(command) > 1 else -1
+            except (TypeError, ValueError):
+                mpv_id = -1
+            index = next((i for i, track in enumerate(self.subtitles) if track.get("mpv_id") == mpv_id), -1)
+            if index >= 0:
+                removed = self.subtitles.pop(index)
+                if removed["id"] == self.selected_subtitle_id:
+                    self.subtitle = None
+                    self.selected_subtitle_id = "off"
+                self.properties["track-list"] = [
+                    {"id": track["mpv_id"], "type": "sub", "title": track["label"], "lang": track["language"], "external": True, "selected": track["id"] == self.selected_subtitle_id}
+                    for track in self.subtitles
+                ]
+                self.revision += 1
+                self.prop("track-list", self.properties["track-list"])
             return None
         if op == "sub-reload":
             return None
