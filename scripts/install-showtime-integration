@@ -7,7 +7,9 @@ if ! flatpak info org.gnome.Showtime >/dev/null 2>&1; then
   flatpak install --user -y flathub org.gnome.Showtime
 fi
 ln -sfn "$root/ani-cli-showtime" "$HOME/.local/bin/ani-cli"
-xdg-mime default org.gnome.Showtime.desktop video/mp4
-xdg-mime default org.gnome.Showtime.desktop video/x-matroska
-xdg-mime default org.gnome.Showtime.desktop application/vnd.apple.mpegurl
+ln -sfn "$root/showtime-mpv-shim.py" "$HOME/.local/bin/mpv"
+for mime in   video/mp4   video/x-matroska   video/webm   video/mpeg   video/quicktime   video/x-msvideo   video/x-flv   video/mp2t   application/vnd.apple.mpegurl   application/x-mpegurl
+do
+  xdg-mime default org.gnome.Showtime.desktop "$mime"
+done
 printf 'Showtime integration installed. ani-cli -> %s\n' "$(readlink -f "$HOME/.local/bin/ani-cli")"

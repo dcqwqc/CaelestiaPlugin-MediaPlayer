@@ -4,6 +4,7 @@ import io
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -125,6 +126,34 @@ def test_adjacent_prefetch_depths():
         p.warm_payload(payload,24)
         assert len(calls)==24,len(calls)
         assert calls[-1].endswith('seg_00023.ts.jpg')
+
+def test_study_language_continues_across_episode_switch():
+    with tempfile.TemporaryDirectory() as d:
+        p=make_proxy(Path(d))
+        p.preferred_study_language='English'
+        p.subtitle_tracks=[{'id':'original-0','source':'original','label':'Original AniCLI English','language':'English','url':'https://x/en12.vtt','default':True,'available':True}]
+        started=[]
+        p.start_study=lambda track_id: started.append(track_id) or p.session_json()
+        payload={
+            'video':'https://example.invalid/episode13.m3u8',
+            'subtitle':'https://x/en13.vtt',
+            'referrer':'https://example.invalid/ref13/',
+            'anime_id':'test-anime-1','anime_title':'Test Anime','episode':'13',
+            'episode_list':['12','13','14'],'mal_id':'1','mode':'sub','quality':'best',
+            'subtitle_tracks':[{'id':'original-0','source':'original','label':'Original AniCLI English','language':'English','url':'https://x/en13.vtt','default':True,'available':True}],
+        }
+        p.apply_payload(payload)
+        deadline=time.monotonic()+1
+        while not started and time.monotonic()<deadline:
+            time.sleep(.01)
+        assert started==['study-ja-original-0'],started
+        assert p.pending_subtitle_id=='study-ja-original-0'
+
+
+def test_study_quality_lock_imported():
+    assert hasattr(mod,"fcntl")
+    assert hasattr(mod.fcntl,"flock")
+    print("PASS test_study_quality_lock_imported")
 
 def test_stale_progress_is_ignored():
     with tempfile.TemporaryDirectory() as d:

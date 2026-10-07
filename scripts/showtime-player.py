@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """GNOME Showtime launcher extended for ani-cli episode sessions."""
 from __future__ import annotations
-import bisect, gettext, json, locale, os, re, signal, sys, threading, urllib.parse, urllib.request
+import bisect, gettext, html, json, locale, os, re, signal, sys, threading, urllib.parse, urllib.request
 from pathlib import Path
 from platform import system
 
@@ -22,7 +22,7 @@ else:
 import gi
 gi.require_version("Gtk","4.0")
 gi.require_version("Adw","1")
-from gi.repository import Adw,Gio,GLib,Gtk
+from gi.repository import Adw,Gio,GLib,Gtk,Pango
 GLib.set_prgname("showtime"); GLib.set_application_name(_("Video Player"))
 Gtk.Window.set_default_icon_name("org.gnome.Showtime")
 Gio.resources_register(Gio.Resource.load(str(Path(PKG_DATA_DIR,"showtime.gresource"))))
@@ -171,6 +171,7 @@ def _apply_subtitle_cues(window,cues):
 
 def _set_external_subtitle(window,uri):
     """Load controller VTT into the GTK overlay; never touch GstPlay suburi."""
+    _clear_study_overlay(window)
     window._pending_subtitle_uri=str(uri or "")
     try:
         window.play.set_subtitle_track_enabled(False)
@@ -212,6 +213,177 @@ def _update_subtitle_overlay(window,pos_ns):
     label.set_text(cues[index][2])
     label.set_visible(True)
 
+def _clear_study_overlay(window):
+    window._study_active=False
+    window._study_cues=[]
+    window._study_starts=[]
+    window._study_last_index=-2
+    if hasattr(window,'_study_box'):
+        window._study_box.set_visible(False)
+
+
+def _apply_study_payload(window,payload):
+    cues=[]
+    for cue in payload.get('cues',[]):
+        try:
+            start=int(cue.get('start_ns')); end=int(cue.get('end_ns'))
+        except Exception:
+            continue
+        if end<=start: continue
+        cues.append(dict(cue,start_ns=start,end_ns=end))
+    cues.sort(key=lambda x:x['start_ns'])
+    window._study_cues=cues
+    window._study_starts=[x['start_ns'] for x in cues]
+    window._study_last_index=-2
+    window._study_active=True
+    window._study_meta={
+        'japanese_source':str(payload.get('japanese_source') or 'Japanese'),
+        'natural_source':str(payload.get('natural_source') or 'Original subtitle'),
+        'gloss_language':str(payload.get('gloss_language') or 'English (JMdict)'),
+    }
+    _apply_subtitle_cues(window,[])
+
+
+def _set_study_subtitle(window,uri):
+    try:
+        with urllib.request.urlopen(str(uri),timeout=8) as response:
+            payload=json.loads(response.read().decode('utf-8','replace'))
+        if not isinstance(payload,dict) or not isinstance(payload.get('cues'),list):
+            raise RuntimeError('study endpoint returned invalid data')
+        _apply_study_payload(window,payload)
+    except Exception as exc:
+        _clear_study_overlay(window)
+        _toast(window,f'Could not load study subtitles: {exc}')
+
+
+def _label_markup(label,text,size='small',weight=None,dim=False):
+    escaped=html.escape(str(text or ''))
+    attrs=[f'size="{size}"']
+    if weight: attrs.append(f'weight="{weight}"')
+    if dim: attrs.append('alpha="75%"')
+    label.set_markup(f'<span {" ".join(attrs)}>{escaped}</span>')
+
+
+def _compact_study_gloss(value):
+    value=str(value or '').strip()
+    if not value:
+        return ''
+    parts=[part.strip() for part in value.split(' · ') if part.strip()]
+    lexical=parts[0] if parts else ''
+    grammar=parts[1:] if len(parts)>1 else []
+    lexical=lexical.split(' / ',1)[0].strip()
+    lexical=re.sub(r'^to\s+','',lexical,flags=re.I)
+    replacements={
+        'be aware of':'know','be acquainted with':'know','name':'name',
+        'one grade':'first-class','medium grade':'middle','sense of duty':'duty',
+    }
+    lexical=replacements.get(lexical.lower(),lexical)
+    grammar_compact=[]
+    for item in grammar:
+        item=item.split(' / ',1)[0].strip()
+        item=re.sub(r'^be\s+','',item,flags=re.I)
+        if item and item not in grammar_compact:
+            grammar_compact.append(item)
+    result=lexical
+    if grammar_compact:
+        result=(result+' · '+','.join(grammar_compact)).strip(' ·')
+    return result
+
+
+def _study_aid_text(tokens):
+    pieces=[]
+    for token in tokens:
+        if str(token.get('pos') or '')=='punct':
+            continue
+        gloss=_compact_study_gloss(token.get('gloss'))
+        romaji=str(token.get('romaji') or '').strip()
+        if gloss and romaji:
+            pieces.append(f'{gloss} · {romaji}')
+        elif gloss or romaji:
+            pieces.append(gloss or romaji)
+    return '    '.join(pieces)
+
+
+def _contains_kanji(text):
+    return any(
+        "㐀"<=ch<="䶿" or "一"<=ch<="鿿" or "豈"<=ch<="﫿"
+        for ch in str(text or "")
+    )
+
+
+def _render_study_cue(window,cue):
+    flow=window._study_tokens
+    child=flow.get_first_child()
+    while child is not None:
+        nxt=child.get_next_sibling()
+        flow.remove(child)
+        child=nxt
+
+    tokens=list(cue.get('tokens',[]) or [])
+    aid_text=_study_aid_text(tokens)
+    aid_len=len(aid_text)
+    aid_size='x-small' if aid_len<=90 else 'xx-small'
+    _label_markup(window._study_aid,aid_text,aid_size,None,True)
+    window._study_aid.set_tooltip_text('  |  '.join(
+        f"{str(t.get('surface') or '')}: {str(t.get('gloss') or '')} · {str(t.get('romaji') or '')}".strip(' ·')
+        for t in tokens if str(t.get('pos') or '')!='punct'
+    ))
+
+    jp_len=len(str(cue.get('japanese') or ''))
+    base_size='x-large' if jp_len<=28 else 'large' if jp_len<=42 else 'medium'
+    for token in tokens:
+        surface=str(token.get('surface') or '')
+        if not surface: continue
+        surface_row=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,spacing=0)
+        surface_row.set_halign(Gtk.Align.CENTER); surface_row.set_can_target(False)
+
+        ruby=token.get('ruby') or [{'text':surface}]
+        for segment in ruby:
+            segment_text=str(segment.get('text') or '')
+            if not segment_text: continue
+            segment_box=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=0)
+            segment_box.set_halign(Gtk.Align.CENTER); segment_box.set_can_target(False)
+            ruby_label=Gtk.Label(); ruby_label.set_halign(Gtk.Align.CENTER); ruby_label.set_can_target(False)
+            base_label=Gtk.Label(); base_label.set_halign(Gtk.Align.CENTER); base_label.set_can_target(False)
+            furigana=str(segment.get('furigana') or '')
+            _label_markup(ruby_label,furigana if furigana else ' ','xx-small',None,True)
+            _label_markup(base_label,segment_text,base_size,'bold')
+            segment_box.append(ruby_label); segment_box.append(base_label)
+            surface_row.append(segment_box)
+        flow.append(surface_row)
+
+    natural=' '.join(str(cue.get('natural') or '').splitlines()).strip()
+    natural_len=len(natural)
+    natural_size='large' if natural_len<=54 else 'medium' if natural_len<=72 else 'small' if natural_len<=90 else 'x-small'
+    _label_markup(window._study_natural,natural,natural_size,'semibold')
+    meta=getattr(window,'_study_meta',{}) or {}
+    window._study_box.set_tooltip_text(
+        f"JP: {meta.get('japanese_source','Japanese')}  •  Natural: {meta.get('natural_source','Original subtitle')}  •  Gloss: {meta.get('gloss_language','English (JMdict)')}"
+    )
+    window._study_box.set_visible(True)
+
+
+def _update_study_overlay(window,pos_ns):
+    if not getattr(window,'_study_active',False):
+        if hasattr(window,'_study_box'): window._study_box.set_visible(False)
+        return False
+    cues=getattr(window,'_study_cues',[]) or []
+    starts=getattr(window,'_study_starts',[]) or []
+    if not cues or not starts:
+        window._study_box.set_visible(False); return True
+    pos=int(pos_ns)
+    index=bisect.bisect_right(starts,pos)-1
+    if index<0 or index>=len(cues) or not (cues[index]['start_ns']<=pos<cues[index]['end_ns']):
+        index=-1
+    if index==getattr(window,'_study_last_index',-2): return True
+    window._study_last_index=index
+    if index<0:
+        window._study_box.set_visible(False)
+    else:
+        _render_study_cue(window,cues[index])
+    return True
+
+
 def _menu_item(label,action,target):
     item=Gio.MenuItem.new(label,None)
     item.set_action_and_target_value(action,GLib.Variant.new_string(target))
@@ -227,6 +399,8 @@ def _rebuild_subtitle_menu(window):
     menu.append_item(_menu_item("None","win.media-subtitle","off"))
 
     original=Gio.Menu()
+    study=Gio.Menu()
+    study_more=Gio.Menu()
     generated=Gio.Menu()
     generated_more=Gio.Menu()
     common_generated={"generated-en","generated-de","generated-ja","generated-ja-romaji"}
@@ -235,13 +409,14 @@ def _rebuild_subtitle_menu(window):
         if not track_id:
             continue
         label=str(track.get("label") or track_id)
-        if track.get("source")=="generated" and not track.get("available"):
+        if track.get("source") in ("generated","study") and not track.get("available"):
             status=str(track.get("status") or "idle")
-            if status in ("starting","extracting","transcribing","translating","generating"):
+            if status in ("starting","extracting","transcribing","translating","generating","preparing-japanese","analyzing","transcribing-quality"):
                 current=track.get("current")
                 total=track.get("total")
                 if isinstance(current,int) and isinstance(total,int) and total>0:
-                    label += f" · {status.title()} {current}/{total}"
+                    phase="Japanese" if status=="transcribing-quality" else status.title()
+                    label += f" · {phase} {current}/{total}"
                 elif status=="extracting":
                     label += " · Extracting…"
                 else:
@@ -256,6 +431,11 @@ def _rebuild_subtitle_menu(window):
                 generated.append_item(item)
             else:
                 generated_more.append_item(item)
+        elif track.get("source")=="study":
+            if str(track.get("language") or "").lower() in ("english","german"):
+                study.append_item(item)
+            else:
+                study_more.append_item(item)
         else:
             original.append_item(item)
 
@@ -263,6 +443,10 @@ def _rebuild_subtitle_menu(window):
         generated.append_submenu("More AI Languages",generated_more)
     if original.get_n_items():
         menu.append_section("Original AniCLI",original)
+    if study_more.get_n_items():
+        study.append_submenu("More Study Languages",study_more)
+    if study.get_n_items():
+        menu.append_section("Japanese Study",study)
     if generated.get_n_items():
         menu.append_section("AI Generated",generated)
     custom=getattr(window,"_custom_subtitle",None)
@@ -273,27 +457,66 @@ def _rebuild_subtitle_menu(window):
     menu.append("Add Subtitle File…","win.choose-subtitles")
 
 
+def _session_display_title(session):
+    anime_title=str((session or {}).get("anime_title") or "").strip()
+    episode=str((session or {}).get("episode") or "").strip()
+    return f"{anime_title} · Episode {episode}" if anime_title and episode else anime_title
+
+
+def _apply_session_title(window,session=None):
+    display_title=_session_display_title(session if session is not None else getattr(window,"_media_session",{}))
+    if not display_title:
+        return
+    window._session_display_title=display_title
+    try:
+        if window.title_label.props.label!=display_title:
+            window.title_label.props.label=display_title
+    except Exception: pass
+    try:
+        if window.get_title()!=display_title:
+            window.set_title(display_title)
+    except Exception: pass
+
+
 def _set_session(window,session,refresh_menu=True):
     previous=getattr(window,"_media_session",{}) or {}
     old_episode=str(previous.get("episode") or "")
     old_selected=str(previous.get("selected_subtitle_id") or "")
     window._media_session=session
     new_episode=str(session.get("episode") or "")
-    anime_title=str(session.get("anime_title") or "").strip()
-    if anime_title and new_episode:
-        display_title=f"{anime_title} · Episode {new_episode}"
-        try:
-            window.title_label.props.label=display_title
-            window.set_title(display_title)
-        except Exception:
-            pass
+    _apply_session_title(window,session)
     new_selected=str(session.get("selected_subtitle_id") or "off")
+
+    # Generic player bridges (not only ani-cli) can request an in-place seek.
+    # A monotonically increasing revision prevents the 1s session poll from
+    # replaying the same seek over and over.
+    seek_revision=int(session.get("seek_revision") or 0)
+    if seek_revision and seek_revision!=getattr(window,"_external_seek_revision",0):
+        window._external_seek_revision=seek_revision
+        seek_us=max(0,int(session.get("seek_us") or 0))
+        def apply_external_seek():
+            try:
+                window.play.seek(seek_us*1000)
+            except Exception as exc:
+                print(f"MediaPlayer: external seek failed: {exc}",file=sys.stderr)
+            return GLib.SOURCE_REMOVE
+        GLib.timeout_add(30,apply_external_seek)
+
     if new_episode!=old_episode:
         window._autoplay_cancelled=False
         window._custom_subtitle_active=False
         window._custom_subtitle=None
+        if new_selected.startswith("study-ja-") and session.get("study_url"):
+            _set_study_subtitle(window,session.get("study_url"))
+        elif session.get("subtitle_url"):
+            _set_external_subtitle(window,session.get("subtitle_url"))
+        else:
+            _set_external_subtitle(window,None)
     elif old_selected and new_selected!=old_selected and not getattr(window,"_custom_subtitle_active",False):
-        _set_external_subtitle(window,session.get("subtitle_url"))
+        if new_selected.startswith("study-ja-") and session.get("study_url"):
+            _set_study_subtitle(window,session.get("study_url"))
+        else:
+            _set_external_subtitle(window,session.get("subtitle_url"))
 
     # On the first window load the video starts before /api/session arrives.
     # Apply the controller's persisted per-episode position once, after GstPlay
@@ -461,6 +684,22 @@ def _generate_subtitle(window,track_id):
         GLib.idle_add(finish)
     threading.Thread(target=worker,daemon=True).start()
 
+def _generate_study(window,track_id):
+    if not SESSION_BASE: return
+    _toast(window,"Preparing Japanese study subtitles…")
+    def worker():
+        try:
+            result=_http_json(f"{SESSION_BASE}/api/study/generate",method="POST",payload={"id":track_id},timeout=8); error=None
+        except Exception as exc:
+            result=None; error=exc
+        def finish():
+            if error: _toast(window,f"Study subtitles could not start: {error}")
+            elif result: _set_session(window,result)
+            return GLib.SOURCE_REMOVE
+        GLib.idle_add(finish)
+    threading.Thread(target=worker,daemon=True).start()
+
+
 def _subtitle_action(window,action,parameter):
     track_id=parameter.get_string()
     if track_id=="custom-local":
@@ -475,6 +714,8 @@ def _subtitle_action(window,action,parameter):
     track=next((x for x in session.get("subtitles",[]) if str(x.get("id"))==track_id),None)
     if track_id.startswith("generated-") and (not track or not track.get("available")):
         _generate_subtitle(window,track_id); return
+    if track_id.startswith("study-ja-") and (not track or not track.get("available")):
+        _generate_study(window,track_id); return
     def worker():
         try:
             updated=_http_json(f"{SESSION_BASE}/api/subtitles/select",method="POST",payload={"id":track_id},timeout=8); error=None
@@ -551,16 +792,23 @@ def _install_session_ui(window):
     window._subtitle_last_index=-2
     window._custom_subtitle=None
     window._custom_subtitle_active=False
+    window._study_active=False
+    window._study_cues=[]
+    window._study_starts=[]
+    window._study_last_index=-2
+    window._study_meta={}
+    window._session_display_title=None
+    window._external_seek_revision=0
 
     subtitle_label=Gtk.Label()
     subtitle_label.set_halign(Gtk.Align.CENTER)
     subtitle_label.set_valign(Gtk.Align.END)
     subtitle_label.set_justify(Gtk.Justification.CENTER)
     subtitle_label.set_wrap(True)
-    subtitle_label.set_max_width_chars(72)
-    subtitle_label.set_margin_start(36)
-    subtitle_label.set_margin_end(36)
-    subtitle_label.set_margin_bottom(78)
+    subtitle_label.set_max_width_chars(90)
+    subtitle_label.set_margin_start(28)
+    subtitle_label.set_margin_end(28)
+    subtitle_label.set_margin_bottom(62)
     subtitle_label.set_can_target(False)
     subtitle_label.add_css_class("osd")
     subtitle_label.add_css_class("title-3")
@@ -568,6 +816,28 @@ def _install_session_ui(window):
     video_overlay=window.picture.get_parent().get_parent()
     video_overlay.add_overlay(subtitle_label)
     window._subtitle_label=subtitle_label
+
+    study_box=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=0)
+    study_box.set_halign(Gtk.Align.CENTER); study_box.set_valign(Gtk.Align.END)
+    study_box.set_margin_start(28); study_box.set_margin_end(28); study_box.set_margin_bottom(62)
+    study_box.set_can_target(False); study_box.add_css_class("osd"); study_box.set_visible(False)
+    study_aid=Gtk.Label(); study_aid.set_halign(Gtk.Align.CENTER); study_aid.set_justify(Gtk.Justification.CENTER)
+    study_aid.set_single_line_mode(True); study_aid.set_wrap(False); study_aid.set_ellipsize(Pango.EllipsizeMode.END)
+    study_aid.set_max_width_chars(135); study_aid.set_can_target(False); study_aid.set_margin_bottom(1)
+    study_tokens=Gtk.FlowBox()
+    study_tokens.set_selection_mode(Gtk.SelectionMode.NONE)
+    study_tokens.set_halign(Gtk.Align.CENTER); study_tokens.set_homogeneous(False)
+    study_tokens.set_row_spacing(0); study_tokens.set_column_spacing(0)
+    study_tokens.set_min_children_per_line(1); study_tokens.set_max_children_per_line(40)
+    study_tokens.set_can_target(False)
+    study_natural=Gtk.Label(); study_natural.set_halign(Gtk.Align.CENTER); study_natural.set_justify(Gtk.Justification.CENTER)
+    study_natural.set_single_line_mode(True); study_natural.set_wrap(False); study_natural.set_ellipsize(Pango.EllipsizeMode.END)
+    study_natural.set_max_width_chars(120); study_natural.set_can_target(False)
+    study_natural.set_margin_top(0); study_natural.set_margin_bottom(0)
+    study_box.append(study_aid); study_box.append(study_tokens); study_box.append(study_natural)
+    video_overlay.add_overlay(study_box)
+    window._study_box=study_box; window._study_aid=study_aid; window._study_tokens=study_tokens
+    window._study_natural=study_natural
 
     prev=Gtk.Button(icon_name="media-skip-backward-symbolic",tooltip_text="Previous Episode")
     next_=Gtk.Button(icon_name="media-skip-forward-symbolic",tooltip_text="Next Episode")
@@ -661,11 +931,18 @@ def _premium_play_video(self,gfile):
         _set_external_subtitle(self,subtitle_uri)
 
 def _premium_media_info_updated(self,obj,media_info):
-    _original_media_info_updated(self,obj,media_info)
+    if not SESSION_URL:
+        _original_media_info_updated(self,obj,media_info)
+        return
+    self.options.menus_building += 1
+    GLib.timeout_add(500,self.options.build_menus,media_info)
+    self.emit("media-info-updated")
+    _apply_session_title(self)
 
 def _premium_position_updated(self,obj,pos):
     _original_position_updated(self,obj,pos)
-    _update_subtitle_overlay(self,pos)
+    if not _update_study_overlay(self,pos):
+        _update_subtitle_overlay(self,pos)
     if SESSION_URL: _update_timed_ui(self,pos)
 
 def _premium_end_of_stream(self,obj):

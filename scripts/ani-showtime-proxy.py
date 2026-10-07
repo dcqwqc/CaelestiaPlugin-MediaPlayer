@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, hashlib, html, json, math, os, re, subprocess, sys, threading, time, urllib.parse, urllib.request
+import argparse, fcntl, hashlib, html, json, math, os, re, subprocess, sys, threading, time, urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -93,6 +93,7 @@ class Proxy:
         self.resolve_events={}
         self.ai_processes={}
         self.study_processes={}
+        self.study_japanese_lock=threading.Lock()
         self.revisions={}
         self.chapters=[]
         self.chapter_status='idle'
@@ -108,6 +109,7 @@ class Proxy:
         self.subtitle_tracks=self.parse_subtitle_catalog(os.environ.get('ANI_SHOWTIME_SUBTITLE_CATALOG',''),subtitle)
         self.selected_subtitle_id=next((x['id'] for x in self.subtitle_tracks if x.get('default')), self.subtitle_tracks[0]['id'] if self.subtitle_tracks else 'off')
         self.pending_subtitle_id=None
+        self.preferred_study_language=None
         self._store_revision()
         threading.Thread(target=self.prune_cache,daemon=True).start()
         threading.Thread(target=self.prefetch_adjacent,daemon=True).start()
@@ -209,7 +211,29 @@ class Proxy:
         logical=f'{anime_id or self.anime_id}:{episode or self.episode}'
         key=hashlib.sha256(logical.encode()).hexdigest()[:24]
         safe=re.sub(r'[^A-Za-z0-9_.-]+','_',natural_track_id)
-        return self.subtitle_cache/key/f'study-ja-{safe}.json'
+        return self.subtitle_cache/key/f'study-v5-ja-{safe}.json'
+
+    def study_quality_dir(self,episode=None,anime_id=None):
+        logical=f'{anime_id or self.anime_id}:{episode or self.episode}'
+        key=hashlib.sha256(logical.encode()).hexdigest()[:24]
+        return self.subtitle_cache/key/'study-quality-ja-1.7b'
+
+    def study_quality_path(self,episode=None,anime_id=None):
+        return self.study_quality_dir(episode,anime_id)/'generated-ja.vtt'
+
+    def ai_environment(self):
+        ai_env=os.environ.copy()
+        driver_root=Path.home()/'.local/share/media-player/intel-gpu-runtime/root'
+        driver_lib=driver_root/'usr/lib'; driver_ocl=driver_lib/'intel-opencl'
+        icd_dir=Path.home()/'.local/share/media-player/intel-gpu-runtime/icd'; intel_icd=icd_dir/'intel.icd'
+        if (driver_ocl/'libigdrcl.so').exists() and intel_icd.exists():
+            old_ld=ai_env.get('LD_LIBRARY_PATH','')
+            ai_env['LD_LIBRARY_PATH']=f'{driver_lib}:{driver_ocl}' + (f':{old_ld}' if old_ld else '')
+            ai_env['OCL_ICD_VENDORS']=str(icd_dir)
+        ai_env['MEDIA_AI_ASR_QUALITY']='quality'
+        ai_env.setdefault('MEDIA_AI_OPENVINO_DEVICE','GPU')
+        ai_env.setdefault('MEDIA_AI_TIMING_MODE','fast')
+        return ai_env
 
     def study_status(self,natural_track_id,episode=None,anime_id=None):
         path=self.study_path(natural_track_id,episode,anime_id)
@@ -217,13 +241,26 @@ class Proxy:
         status_path=path.with_suffix('.status.json')
         try:
             value=json.loads(status_path.read_text())
-            return value if isinstance(value,dict) else {'status':'idle','error':None}
+            if not isinstance(value,dict): return {'status':'idle','error':None}
+            if value.get('status')=='transcribing-quality':
+                progress=self.study_quality_dir(episode,anime_id)/'asr-backend.json'
+                if progress.exists():
+                    try:
+                        p=json.loads(progress.read_text())
+                        current=p.get('block',p.get('chunk')); total=p.get('blocks',p.get('chunks'))
+                        if isinstance(current,int): value['current']=current
+                        if isinstance(total,int): value['total']=total
+                        if p.get('backend'): value['backend']=p.get('backend')
+                        if p.get('device'): value['device']=p.get('device')
+                    except Exception: pass
+            return value
         except Exception:
             return {'status':'idle','error':None}
 
     def study_tracks(self):
         tracks=[]
-        for track in self.subtitle_tracks:
+        ordered=sorted(self.subtitle_tracks,key=lambda x:(0 if str(x.get('language','')).lower()=='english' else 1 if str(x.get('language','')).lower()=='german' else 2,str(x.get('language',''))))
+        for track in ordered:
             if self._is_japanese_track(track):
                 continue
             track_id=str(track.get('id') or '')
@@ -235,7 +272,7 @@ class Proxy:
                 'label':f'Japanese Study · {language}','language':language,
                 'available':self.study_path(track_id).exists(),
                 'status':state.get('status','idle'),'error':state.get('error'),
-                'japanese_source':'Original Japanese' if self._japanese_original() else 'Qwen3-ASR Japanese fallback',
+                'japanese_source':'Original AniCLI Japanese' if self._japanese_original() else 'Qwen3-ASR 1.7B Japanese fallback',
             })
         return tracks
 
@@ -333,7 +370,9 @@ class Proxy:
         }
 
     def apply_payload(self,payload):
+        continue_study=None
         with self.session_lock:
+            previous_study_language=self.preferred_study_language
             self.video=payload['video']
             self.subtitle=payload.get('subtitle','')
             self.referrer=payload.get('referrer',self.referrer)
@@ -350,6 +389,12 @@ class Proxy:
                 self.subtitle_tracks[0]['id'] if self.subtitle_tracks else 'off',
             )
             self.pending_subtitle_id=None
+            if previous_study_language:
+                natural=next((x for x in self.subtitle_tracks if str(x.get('language','')).lower()==previous_study_language.lower() and not self._is_japanese_track(x)),None)
+                if natural:
+                    self.selected_subtitle_id=natural['id']
+                    continue_study=f"study-ja-{natural['id']}"
+                    self.pending_subtitle_id=continue_study
             self.video_duration=None
             self.segment_durations=[]
             self._subtitle_cues=None
@@ -362,6 +407,8 @@ class Proxy:
             allowed={x for x in (self.adjacent(-1),self.adjacent(1)) if x}
             self.prepared={ep:data for ep,data in self.prepared.items() if ep in allowed}
         threading.Thread(target=self.prefetch_adjacent,daemon=True).start()
+        if continue_study:
+            threading.Thread(target=lambda: self.start_study(continue_study),daemon=True,name='study-continuation').start()
         return self.session_json()
 
     def accept_handoff(self,body,mode='prefetch'):
@@ -515,11 +562,16 @@ class Proxy:
         return None
 
     def select_subtitle(self,track_id):
-        if track_id!='off' and not any(x['id']==track_id for x in self.subtitle_catalog()):
+        catalog=self.subtitle_catalog()
+        track=next((x for x in catalog if x['id']==track_id),None)
+        if track_id!='off' and not track:
             raise RuntimeError('subtitle track not found')
+        if track and track.get('source')=='study' and not track.get('available'):
+            raise RuntimeError('study subtitle track is not ready yet')
         with self.session_lock:
             self.selected_subtitle_id=track_id
             self.pending_subtitle_id=None
+            self.preferred_study_language=(str(track.get('language') or '') if track and track.get('source')=='study' else None)
         return self.session_json()
 
     def start_generation(self,track_id,select_when_ready=True):
@@ -573,19 +625,7 @@ class Proxy:
             '--media-url',f'{self.base_url}/master.m3u8?rev={revision}',
             '--output-dir',str(out_dir),'--target',lang,
         ]
-        ai_env=os.environ.copy()
-        driver_root=Path.home()/'.local/share/media-player/intel-gpu-runtime/root'
-        driver_lib=driver_root/'usr/lib'
-        driver_ocl=driver_lib/'intel-opencl'
-        icd_dir=Path.home()/'.local/share/media-player/intel-gpu-runtime/icd'
-        intel_icd=icd_dir/'intel.icd'
-        if (driver_ocl/'libigdrcl.so').exists() and intel_icd.exists():
-            old_ld=ai_env.get('LD_LIBRARY_PATH','')
-            ai_env['LD_LIBRARY_PATH']=f'{driver_lib}:{driver_ocl}' + (f':{old_ld}' if old_ld else '')
-            ai_env['OCL_ICD_VENDORS']=str(icd_dir)
-        ai_env.setdefault('MEDIA_AI_ASR_QUALITY','quality')
-        ai_env.setdefault('MEDIA_AI_OPENVINO_DEVICE','GPU')
-        ai_env.setdefault('MEDIA_AI_TIMING_MODE','fast')
+        ai_env=self.ai_environment()
 
         proc=subprocess.Popen(
             cmd,env=ai_env,stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=True
@@ -638,6 +678,8 @@ class Proxy:
             raise RuntimeError('original translation track not found')
         if self._is_japanese_track(natural_track):
             raise RuntimeError('choose a non-Japanese original track for the natural translation')
+        with self.session_lock:
+            self.preferred_study_language=str(natural_track.get('language') or '') or None
 
         episode=str(snapshot.get('episode') or '')
         anime_id=str(snapshot.get('anime_id') or self.anime_id)
@@ -675,16 +717,27 @@ class Proxy:
                         jp_file.write_bytes(resp.read())
                 else:
                     japanese_source='Qwen3-ASR 1.7B Japanese fallback'
-                    ja_path=self.generated_path('ja',episode,anime_id)
+                    ja_path=self.study_quality_path(episode,anime_id)
                     if not ja_path.exists():
-                        self.start_generation('generated-ja',select_when_ready=False)
-                        deadline=time.monotonic()+1800
-                        while time.monotonic()<deadline and not ja_path.exists():
-                            state=self.generated_status('ja',episode,anime_id)
-                            if state.get('status')=='error':
-                                raise RuntimeError(state.get('error') or 'Japanese transcription failed')
-                            time.sleep(.5)
-                        if not ja_path.exists(): raise RuntimeError('Japanese transcription timed out')
+                        with self.study_japanese_lock:
+                            quality_dir=self.study_quality_dir(episode,anime_id)
+                            quality_dir.mkdir(parents=True,exist_ok=True)
+                            # Cross-process guard too: two stale/parallel proxy instances
+                            # must never write the same episode quality cache at once.
+                            lock_path=quality_dir/'.generation.lock'
+                            with lock_path.open('w') as lock_file:
+                                fcntl.flock(lock_file.fileno(),fcntl.LOCK_EX)
+                                if not ja_path.exists():
+                                    status_path.write_text(json.dumps({'status':'transcribing-quality','error':None}))
+                                    logdir=Path(os.environ.get('XDG_RUNTIME_DIR',f'/run/user/{os.getuid()}'))/'ani-showtime'
+                                    logdir.mkdir(parents=True,exist_ok=True)
+                                    with (logdir/f'study-ja-{episode}.log').open('ab') as asr_log:
+                                        subprocess.run([
+                                            str(env_python),str(self.root/'ai-subtitles.py'),
+                                            '--media-url',f'{self.base_url}/master.m3u8?rev={revision}',
+                                            '--output-dir',str(quality_dir),'--target','ja','--asr-quality','quality',
+                                        ],env=self.ai_environment(),check=True,stdin=subprocess.DEVNULL,stdout=asr_log,stderr=asr_log,timeout=1800)
+                    if not ja_path.exists(): raise RuntimeError('quality Japanese transcription was not created')
                     jp_file.write_bytes(ja_path.read_bytes())
 
                 status_path.write_text(json.dumps({'status':'analyzing','error':None}))
