@@ -195,16 +195,21 @@ def parse_vtt(path: Path) -> list[tuple[float,float,str]]:
     return cues
 
 
-def extract_audio(media_url: str,wav: Path) -> None:
+def extract_audio(media_url: str,wav: Path,http_headers: list[str] | None = None) -> None:
     if wav.exists() and wav.stat().st_size>1_000_000: return
     wav.parent.mkdir(parents=True,exist_ok=True)
     temp=wav.with_suffix(".tmp.wav")
     cmd=[
         "ffmpeg","-nostdin","-y","-hide_banner","-loglevel","error",
         "-extension_picky","0","-allowed_extensions","ALL","-allowed_segment_extensions","ALL",
+    ]
+    headers=[str(x).strip() for x in (http_headers or []) if str(x).strip()]
+    if headers:
+        cmd.extend(["-headers","\r\n".join(headers)+"\r\n"])
+    cmd.extend([
         "-i",media_url,
         "-vn","-ac","1","-ar","16000","-c:a","pcm_s16le",str(temp),
-    ]
+    ])
     subprocess.run(cmd,check=True)
     os.replace(temp,wav)
 
@@ -823,6 +828,7 @@ def translate_cues(cues,out_dir: Path,target: str,model_name: str) -> None:
 def main() -> int:
     ap=argparse.ArgumentParser()
     ap.add_argument("--media-url",required=True)
+    ap.add_argument("--http-header",action="append",default=[],help="HTTP header passed to ffmpeg input; repeatable")
     ap.add_argument("--output-dir",required=True)
     ap.add_argument("--target",required=True,choices=tuple(LANGUAGE_NAMES)+("ja-romaji",))
     ap.add_argument("--asr-model",default=None)
@@ -850,7 +856,7 @@ def main() -> int:
             fcntl.flock(lock_file.fileno(),fcntl.LOCK_EX)
             status("extracting")
             wav=out_dir/"audio-16k-mono.wav"
-            extract_audio(args.media_url,wav)
+            extract_audio(args.media_url,wav,args.http_header)
             status("transcribing")
             asr_model,openvino_model=resolve_asr_models(args.asr_quality,args.asr_model,args.openvino_model)
             cues=generate_japanese(wav,out_dir,asr_model,args.aligner_model,openvino_model,args.openvino_device)

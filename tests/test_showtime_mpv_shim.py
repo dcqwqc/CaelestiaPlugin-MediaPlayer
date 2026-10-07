@@ -45,3 +45,61 @@ def test_mpv_ipc_json_protocol():
         sock.close()
         server.shutdown()
         server.server_close()
+
+
+def test_parse_args_keeps_kunai_http_headers_for_ai_input():
+    m = load_shim()
+    cfg = m.parse_args([
+        "--http-header-fields=Origin: https://example.invalid,Authorization: Bearer token",
+        "--referrer=https://ref.example/",
+        "https://cdn.example/video.m3u8",
+    ])
+    assert "Origin: https://example.invalid" in cfg["http_headers"]
+    assert "Authorization: Bearer token" in cfg["http_headers"]
+    b = m.Bridge(cfg)
+    assert "Referer: https://ref.example/" in b.http_headers
+
+
+def test_generated_subtitle_catalog_and_selection():
+    m = load_shim()
+    b = m.Bridge({"url": "https://example.invalid/a.m3u8", "title": "Demo Episode"})
+    with tempfile.TemporaryDirectory() as td:
+        b.subtitle_cache = Path(td)
+        b.base_url = "http://127.0.0.1:12345"
+        generated = b.generated_path("en")
+        generated.parent.mkdir(parents=True, exist_ok=True)
+        generated.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n")
+
+        track = next(x for x in b.subtitle_catalog() if x["id"] == "generated-en")
+        assert track["available"] is True
+        session = b.select_subtitle("generated-en")
+        assert session["selected_subtitle_id"] == "generated-en"
+        assert session["subtitle_url"].endswith("/api/subtitles/generated-en.vtt")
+        assert b.generated_bytes("generated-en").startswith(b"WEBVTT")
+
+
+def test_ai_extract_audio_passes_headers_to_ffmpeg():
+    path = Path(__file__).parents[1] / "scripts" / "ai-subtitles.py"
+    spec = importlib.util.spec_from_file_location("ai_subtitles_header_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    calls = []
+
+    def fake_run(cmd, check):
+        calls.append(cmd)
+        Path(cmd[-1]).write_bytes(b"wav")
+
+    module.subprocess.run = fake_run
+    with tempfile.TemporaryDirectory() as td:
+        wav = Path(td) / "audio.wav"
+        module.extract_audio(
+            "https://example.invalid/video.m3u8",
+            wav,
+            ["Referer: https://example.invalid/", "Authorization: Bearer secret"],
+        )
+        assert wav.exists()
+
+    cmd = calls[0]
+    header_value = cmd[cmd.index("-headers") + 1]
+    assert "Referer: https://example.invalid/\r\n" in header_value
+    assert "Authorization: Bearer secret\r\n" in header_value

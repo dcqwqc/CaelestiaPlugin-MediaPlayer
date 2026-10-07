@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -21,6 +22,66 @@ ROOT = Path(__file__).resolve().parent
 SHOWTIME_BOOTSTRAP = ROOT / "showtime-player.py"
 REAL_MPV = Path("/usr/bin/mpv")
 
+GENERATED_LANGUAGES = [
+    ('en','English'),
+    ('de','German'),
+    ('ja','Japanese'),
+    ('ja-romaji','Japanese Romaji'),
+    ('af','Afrikaans'),
+    ('ar','Arabic'),
+    ('eu','Basque'),
+    ('bn','Bengali'),
+    ('bg','Bulgarian'),
+    ('ca','Catalan'),
+    ('zh','Chinese (Simplified)'),
+    ('zh-TW','Chinese (Traditional)'),
+    ('hr','Croatian'),
+    ('cs','Czech'),
+    ('da','Danish'),
+    ('nl','Dutch'),
+    ('et','Estonian'),
+    ('fil','Filipino'),
+    ('fi','Finnish'),
+    ('fr','French'),
+    ('gl','Galician'),
+    ('el','Greek'),
+    ('gu','Gujarati'),
+    ('he','Hebrew'),
+    ('hi','Hindi'),
+    ('hu','Hungarian'),
+    ('is','Icelandic'),
+    ('id','Indonesian'),
+    ('it','Italian'),
+    ('kn','Kannada'),
+    ('ko','Korean'),
+    ('lv','Latvian'),
+    ('lt','Lithuanian'),
+    ('ms','Malay'),
+    ('ml','Malayalam'),
+    ('mt','Maltese'),
+    ('mr','Marathi'),
+    ('no','Norwegian'),
+    ('fa','Persian'),
+    ('pl','Polish'),
+    ('pt','Portuguese'),
+    ('pa','Punjabi'),
+    ('ro','Romanian'),
+    ('ru','Russian'),
+    ('sr','Serbian'),
+    ('sk','Slovak'),
+    ('sl','Slovenian'),
+    ('es','Spanish'),
+    ('sw','Swahili'),
+    ('sv','Swedish'),
+    ('ta','Tamil'),
+    ('te','Telugu'),
+    ('th','Thai'),
+    ('tr','Turkish'),
+    ('uk','Ukrainian'),
+    ('ur','Urdu'),
+    ('vi','Vietnamese'),
+]
+
 
 def json_line(payload):
     return (json.dumps(payload, separators=(",", ":")) + "\n").encode()
@@ -36,6 +97,7 @@ def parse_args(argv):
         "title": "Video",
         "subtitle": None,
         "referrer": "",
+        "http_headers": [],
         "start": 0.0,
         "chapters_file": None,
         "persistent": False,
@@ -47,6 +109,11 @@ def parse_args(argv):
             state["title"] = arg.split("=", 1)[1]
         elif arg.startswith("--sub-file=") and not state["subtitle"]:
             state["subtitle"] = arg.split("=", 1)[1]
+        elif arg.startswith("--http-header-fields="):
+            raw = arg.split("=", 1)[1]
+            state["http_headers"].extend(x.strip() for x in raw.split(",") if x.strip())
+        elif arg.startswith("--user-agent="):
+            state["http_headers"].append("User-Agent: " + arg.split("=", 1)[1])
         elif arg.startswith("--referrer="):
             state["referrer"] = arg.split("=", 1)[1]
         elif arg.startswith("--start="):
@@ -111,6 +178,10 @@ class Bridge:
         self.title = cfg.get("title") or "Video"
         self.subtitle = cfg.get("subtitle")
         self.referrer = cfg.get("referrer") or ""
+        self.http_headers = list(cfg.get("http_headers") or [])
+        if self.referrer and not any(str(h).lower().startswith(("referer:", "referrer:")) for h in self.http_headers):
+            self.http_headers.append("Referer: " + self.referrer)
+        self.base_url = ""
         self.resume_us = int(float(cfg.get("start") or 0) * 1_000_000)
         self.chapters = parse_ffmeta(cfg.get("chapters_file"))
         self.position = float(cfg.get("start") or 0)
@@ -143,6 +214,11 @@ class Bridge:
             "user-data/kunai-track-changed": "",
         }
         self.subtitles = []
+        self.subtitle_cache = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "media-player" / "subtitles"
+        self.subtitle_cache.mkdir(parents=True, exist_ok=True)
+        self.ai_processes = {}
+        self.pending_subtitle_id = None
+        self.selected_subtitle_id = "off"
         if self.subtitle:
             self.add_subtitle(self.subtitle, "Subtitle", "", selected=True)
 
@@ -202,8 +278,170 @@ class Bridge:
             ]
             return item
 
+    def media_cache_key(self):
+        try:
+            parsed = urllib.parse.urlsplit(self.url)
+            stable_url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+        except Exception:
+            stable_url = self.url
+        logical = f"{self.title}:{stable_url}"
+        return hashlib.sha256(logical.encode()).hexdigest()[:24]
+
+    def generated_path(self, lang):
+        return self.subtitle_cache / self.media_cache_key() / f"generated-{lang}.vtt"
+
+    def generated_status(self, lang):
+        path = self.generated_path(lang)
+        if path.exists():
+            return {"status": "ready", "error": None}
+        status_path = path.with_name(f"generated-{lang}.status.json")
+        try:
+            value = json.loads(status_path.read_text())
+            return value if isinstance(value, dict) else {"status": "idle", "error": None}
+        except Exception:
+            return {"status": "idle", "error": None}
+
+    def subtitle_catalog(self):
+        tracks = [dict(item) for item in self.subtitles]
+        for lang, label in GENERATED_LANGUAGES:
+            path = self.generated_path(lang)
+            state = self.generated_status(lang)
+            tracks.append({
+                "id": f"generated-{lang}",
+                "source": "generated",
+                "label": f"AI Generated {label}",
+                "language": label,
+                "available": path.exists(),
+                "status": state.get("status", "idle"),
+                "error": state.get("error"),
+                "url": None,
+            })
+        return tracks
+
+    def ai_environment(self):
+        env = os.environ.copy()
+        driver_root = Path.home() / ".local/share/media-player/intel-gpu-runtime/root"
+        driver_lib = driver_root / "usr/lib"
+        driver_ocl = driver_lib / "intel-opencl"
+        icd_dir = Path.home() / ".local/share/media-player/intel-gpu-runtime/icd"
+        intel_icd = icd_dir / "intel.icd"
+        if (driver_ocl / "libigdrcl.so").exists() and intel_icd.exists():
+            old_ld = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = f"{driver_lib}:{driver_ocl}" + (f":{old_ld}" if old_ld else "")
+            env["OCL_ICD_VENDORS"] = str(icd_dir)
+        env["MEDIA_AI_ASR_QUALITY"] = "quality"
+        env.setdefault("MEDIA_AI_OPENVINO_DEVICE", "GPU")
+        env.setdefault("MEDIA_AI_TIMING_MODE", "fast")
+        return env
+
+    def start_generation(self, track_id):
+        if not track_id.startswith("generated-"):
+            raise RuntimeError("not an AI subtitle track")
+        lang = track_id.removeprefix("generated-")
+        if lang not in {code for code, _ in GENERATED_LANGUAGES}:
+            raise RuntimeError("unsupported generated subtitle language")
+        path = self.generated_path(lang)
+        if path.exists():
+            with self.lock:
+                self.selected_subtitle_id = track_id
+                self.subtitle = None
+                self.pending_subtitle_id = None
+                self.revision += 1
+            return self.session()
+
+        key = (self.media_cache_key(), lang)
+        with self.lock:
+            running = self.ai_processes.get(key)
+            if running is not None and running.poll() is None:
+                self.pending_subtitle_id = track_id
+                return self.session()
+
+        env_python = Path.home() / ".local/share/media-player/ai-env/bin/python"
+        if not env_python.exists():
+            raise RuntimeError("AI subtitle environment is not installed yet")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            str(env_python), str(ROOT / "ai-subtitles.py"),
+            "--media-url", self.url,
+            "--output-dir", str(path.parent),
+            "--target", lang,
+        ]
+        for header in self.http_headers:
+            cmd.extend(["--http-header", str(header)])
+        logdir = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "showtime-mpv"
+        logdir.mkdir(parents=True, exist_ok=True)
+        log = (logdir / f"ai-{self.media_cache_key()}-{lang}.log").open("ab")
+        proc = subprocess.Popen(
+            cmd,
+            env=self.ai_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=log,
+            start_new_session=True,
+        )
+        with self.lock:
+            self.ai_processes[key] = proc
+            self.pending_subtitle_id = track_id
+            self.revision += 1
+
+        def monitor():
+            code = proc.wait()
+            log.close()
+            with self.lock:
+                self.ai_processes.pop(key, None)
+                if code == 0 and path.exists() and self.media_cache_key() == key[0]:
+                    self.selected_subtitle_id = track_id
+                    self.subtitle = None
+                if self.pending_subtitle_id == track_id:
+                    self.pending_subtitle_id = None
+                self.revision += 1
+
+        threading.Thread(target=monitor, daemon=True).start()
+        return self.session()
+
+    def generated_bytes(self, track_id):
+        if not track_id.startswith("generated-"):
+            return None
+        path = self.generated_path(track_id.removeprefix("generated-"))
+        return path.read_bytes() if path.exists() else None
+
+    def select_subtitle(self, track_id):
+        if track_id == "off":
+            with self.lock:
+                self.subtitle = None
+                self.selected_subtitle_id = "off"
+                self.pending_subtitle_id = None
+                self.revision += 1
+            return self.session()
+        if track_id.startswith("generated-"):
+            path = self.generated_path(track_id.removeprefix("generated-"))
+            if not path.exists():
+                raise RuntimeError("generated subtitle is not ready")
+            with self.lock:
+                self.subtitle = None
+                self.selected_subtitle_id = track_id
+                self.pending_subtitle_id = None
+                self.revision += 1
+            return self.session()
+        track = next((item for item in self.subtitles if item["id"] == track_id), None)
+        if not track:
+            raise RuntimeError("subtitle track not found")
+        with self.lock:
+            self.subtitle = track["url"]
+            self.selected_subtitle_id = track_id
+            self.pending_subtitle_id = None
+            self.revision += 1
+        return self.session()
+
     def session(self):
         with self.lock:
+            selected = getattr(self, "selected_subtitle_id", "off")
+            subtitle_url = self.subtitle
+            if selected == "off":
+                subtitle_url = None
+            elif selected.startswith("generated-") and self.base_url:
+                if self.generated_bytes(selected) is not None:
+                    subtitle_url = f"{self.base_url}/api/subtitles/{urllib.parse.quote(selected)}.vtt"
             return {
                 "ok": True,
                 "media_url": self.url,
@@ -211,15 +449,16 @@ class Bridge:
                 "episode": "",
                 "previous_episode": self.prev_label if self.can_prev else None,
                 "next_episode": self.next_label if self.can_next else None,
-                "subtitle_url": self.subtitle,
+                "subtitle_url": subtitle_url,
                 "study_url": None,
-                "selected_subtitle_id": getattr(self, "selected_subtitle_id", "off"),
-                "subtitles": list(self.subtitles),
+                "selected_subtitle_id": selected,
+                "subtitles": self.subtitle_catalog(),
                 "chapters": list(self.chapters),
                 "resume_us": self.resume_us,
                 "revision": self.revision,
                 "seek_us": int(self.position * 1_000_000),
                 "seek_revision": self.seek_revision,
+                "pending_subtitle_id": self.pending_subtitle_id,
             }
 
     def update_progress(self, body):
@@ -421,10 +660,25 @@ class HTTPHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def send_bytes(self, data, content_type="application/octet-stream", status=200):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
         if u.path == "/api/session":
             self.send_json(self.bridge.session())
+            return
+        if u.path.startswith("/api/subtitles/") and u.path.endswith(".vtt"):
+            track_id = urllib.parse.unquote(u.path[len("/api/subtitles/"):-4])
+            data = self.bridge.generated_bytes(track_id)
+            if data is None:
+                self.send_json({"ok": False, "error": "subtitle not found"}, 404)
+            else:
+                self.send_bytes(data, "text/vtt; charset=utf-8")
             return
         self.send_json({"ok": False, "error": "not found"}, 404)
 
@@ -444,17 +698,18 @@ class HTTPHandler(BaseHTTPRequestHandler):
         if u.path == "/api/subtitles/select":
             body = self.read_json()
             track_id = str(body.get("id") or "off")
-            with self.bridge.lock:
-                if track_id == "off":
-                    self.bridge.subtitle = None
-                    self.bridge.selected_subtitle_id = "off"
-                else:
-                    track = next((x for x in self.bridge.subtitles if x["id"] == track_id), None)
-                    if track:
-                        self.bridge.subtitle = track["url"]
-                        self.bridge.selected_subtitle_id = track_id
-                self.bridge.revision += 1
-            self.send_json(self.bridge.session())
+            try:
+                self.send_json(self.bridge.select_subtitle(track_id))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 400)
+            return
+        if u.path == "/api/subtitles/generate":
+            body = self.read_json()
+            track_id = str(body.get("id") or "")
+            try:
+                self.send_json(self.bridge.start_generation(track_id))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 400)
             return
         self.send_json({"ok": False, "error": "not found"}, 404)
 
@@ -496,6 +751,7 @@ def main(argv):
     bridge = Bridge(cfg)
     httpd = HTTPServer(("127.0.0.1", 0), bridge)
     http_port = httpd.server_address[1]
+    bridge.base_url = f"http://127.0.0.1:{http_port}"
     http_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     http_thread.start()
 
@@ -516,6 +772,11 @@ def main(argv):
         code = proc.wait()
     finally:
         bridge.closed = True
+        with bridge.lock:
+            ai_processes = list(bridge.ai_processes.values())
+        for ai_proc in ai_processes:
+            if ai_proc.poll() is None:
+                ai_proc.terminate()
         bridge.broadcast({"event": "end-file", "reason": "quit"})
         with bridge.cond:
             bridge.cond.notify_all()
