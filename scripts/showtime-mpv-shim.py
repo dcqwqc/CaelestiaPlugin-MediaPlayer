@@ -490,7 +490,9 @@ class Bridge:
                 "media_url": (
                     media_proxy_url(self.url, self.media_proxy_port, self.media_token)
                     if self.http_headers else None
-                ) or self.url,
+                ) or (
+                    Path(self.url).resolve().as_uri() if self.url.startswith("/") else self.url
+                ),
                 "http_headers": (
                     {} if self.http_headers and media_proxy_url(
                         self.url, self.media_proxy_port, self.media_token
@@ -891,15 +893,31 @@ def launch_showtime(bridge, http_port):
     cmd = [
         "flatpak", "run",
         "--share=network",
-        "--filesystem=host:ro",
         f"--filesystem={ROOT}:ro",
         "--command=python3",
         f"--env=MEDIA_PLAYER_SESSION_URL=http://127.0.0.1:{http_port}/api/session",
         f"--env=MEDIA_PLAYER_SESSION_TOKEN={bridge.token}",
     ]
+    # Only grant host files explicitly selected for playback. The subtitle
+    # generator runs in the host bridge; the Flatpak has no need for host:ro.
+    for item in (bridge.url, bridge.subtitle):
+        if not isinstance(item, str) or not item:
+            continue
+        parsed = urllib.parse.urlsplit(item)
+        path = (
+            urllib.parse.unquote(parsed.path)
+            if parsed.scheme == "file" and not parsed.netloc
+            else item if not parsed.scheme and item.startswith("/") else None
+        )
+        if path:
+            media_file = Path(path)
+            if media_file.is_file():
+                cmd.append(f"--filesystem={media_file.resolve()}:ro")
     if bridge.subtitle:
         cmd.append(f"--env=MEDIA_PLAYER_SUBTITLE_URI={bridge.subtitle}")
-    cmd += ["org.gnome.Showtime", str(SHOWTIME_BOOTSTRAP), "--new-window", bridge.url]
+    # Showtime retrieves the media URL from authenticated /api/session itself.
+    # Keep signed URLs and the loopback media bearer out of process argv.
+    cmd += ["org.gnome.Showtime", str(SHOWTIME_BOOTSTRAP), "--new-window"]
     return subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 

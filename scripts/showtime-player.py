@@ -604,7 +604,13 @@ def _refresh_session_async(window):
             window._session_refreshing=False
             if session is not None:
                 window._session_consecutive_failures=0
-                _set_session(window,session)
+                # The window launches without media arguments: never expose
+                # signed source URLs or bearer tokens in process argv.
+                # The first authenticated session supplies the URI to open.
+                if not getattr(window, "_media_session", None) and not window.play.props.uri:
+                    _play_session(window, session)
+                else:
+                    _set_session(window,session)
             elif os.environ.get("MEDIA_PLAYER_SESSION_TOKEN"):
                 window._session_consecutive_failures=getattr(window,"_session_consecutive_failures",0)+1
                 if window._session_consecutive_failures>=3:

@@ -71,6 +71,43 @@ class _Response:
 
 
 class HTTPProxyTests(unittest.TestCase):
+    def test_controller_auth_and_failed_playback_event(self):
+        spec = importlib.util.spec_from_file_location("shim_auth_test", ROOT / "showtime-mpv-shim.py")
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        b = m.Bridge({"url": "https://cdn.example.org/series/master.mpd"})
+        server = m.HTTPServer(("127.0.0.1", 0), b)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=3)
+        try:
+            conn.request("GET", "/api/session")
+            response = conn.getresponse()
+            self.assertEqual(response.status, 403)
+            response.read()
+            headers = {"X-Showtime-Session-Token": b.token}
+            conn.request("GET", "/api/session", headers=headers)
+            response = conn.getresponse()
+            self.assertEqual(response.status, 200)
+            response.read()
+            failure = b'{"reason":"access-denied","media_revision":1}'
+            conn.request("POST", "/api/playback-error", body=failure)
+            response = conn.getresponse()
+            self.assertEqual(response.status, 403)
+            response.read()
+            self.assertIsNone(b.failed_media_revision)
+            conn.request("POST", "/api/playback-error", body=failure, headers=headers)
+            response = conn.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertTrue(__import__("json").loads(response.read())["accepted"])
+            self.assertEqual(b.failed_media_revision, 1)
+            conn.request("POST", "/api/playback-error", body=failure, headers=headers)
+            response = conn.getresponse()
+            self.assertFalse(__import__("json").loads(response.read())["accepted"])
+        finally:
+            conn.close()
+            server.shutdown()
+            server.server_close()
+
     def test_media_is_bearer_scoped_and_source_headers_forwarded(self):
         spec = importlib.util.spec_from_file_location("showtime_test_shim", ROOT / "showtime-mpv-shim.py")
         module = importlib.util.module_from_spec(spec)
