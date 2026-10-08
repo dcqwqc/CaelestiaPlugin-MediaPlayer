@@ -37,7 +37,7 @@ def test_subtitle_catalog():
         {'label':'German','src':'https://x/de.vtt','kind':'captions','default':False},
     ])
     tracks=mod.Proxy.parse_subtitle_catalog(raw)
-    assert [x['label'] for x in tracks]==['Original AniCLI English','Original AniCLI German']
+    assert [x['label'] for x in tracks]==['English','German']
     assert tracks[0]['default'] is True
 
 def test_worker_root_exists():

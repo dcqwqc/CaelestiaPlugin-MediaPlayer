@@ -23,6 +23,9 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from showtime_media_proxy import MEDIA_PREFIX, media_proxy_url, relay_request
+from showtime_subtitle_preference import (
+    should_select_new_track, subtitle_intent, load_preference, save_preference,
+)
 SHOWTIME_BOOTSTRAP = ROOT / "showtime-player.py"
 REAL_MPV = Path("/usr/bin/mpv")
 
@@ -246,8 +249,21 @@ class Bridge:
         self.ai_processes = {}
         self.pending_subtitle_id = None
         self.selected_subtitle_id = "off"
+        # Explicit choice survives new track IDs, provider changes and episodes.
+        # None means follow provider defaults; ("off", "") is an explicit None.
+        self.persist_subtitle_choice = bool(cfg.get("persistent"))
+        self.subtitle_preference = (
+            load_preference() if self.persist_subtitle_choice else ("original","en")
+        )
         if self.subtitle:
             self.add_subtitle(self.subtitle, "Subtitle", "", selected=True)
+
+    def remember_subtitle_preference(self, intent):
+        if intent is None:
+            return
+        self.subtitle_preference=intent
+        if self.persist_subtitle_choice:
+            save_preference(intent)
 
     def add_client(self, sock):
         with self.lock:
@@ -282,9 +298,11 @@ class Bridge:
         with self.lock:
             existing = next((x for x in self.subtitles if x["url"] == url), None)
             if existing:
-                if selected:
+                if should_select_new_track(self.subtitle_preference, existing, selected):
                     self.subtitle = url
                     self.selected_subtitle_id = existing["id"]
+                    for track in self.properties["track-list"]:
+                        track["selected"] = track["id"] == existing["mpv_id"]
                 return existing
             mpv_id = self.next_subtitle_mpv_id
             self.next_subtitle_mpv_id += 1
@@ -298,7 +316,8 @@ class Bridge:
                 "available": True,
             }
             self.subtitles.append(item)
-            if selected or not getattr(self, "selected_subtitle_id", None):
+            choose = should_select_new_track(self.subtitle_preference, item, selected)
+            if choose:
                 self.subtitle = url
                 self.selected_subtitle_id = item["id"]
             self.properties["track-list"] = [
@@ -379,6 +398,7 @@ class Bridge:
         path = self.generated_path(lang)
         if path.exists():
             with self.lock:
+                self.remember_subtitle_preference(("generated", lang))
                 self.selected_subtitle_id = track_id
                 self.subtitle = None
                 self.pending_subtitle_id = None
@@ -387,6 +407,7 @@ class Bridge:
 
         key = (self.media_cache_key(), lang)
         with self.lock:
+            self.remember_subtitle_preference(("generated", lang))
             running = self.ai_processes.get(key)
             if running is not None and running.poll() is None:
                 self.pending_subtitle_id = track_id
@@ -444,6 +465,7 @@ class Bridge:
     def select_subtitle(self, track_id):
         if track_id == "off":
             with self.lock:
+                self.remember_subtitle_preference(("off", ""))
                 self.subtitle = None
                 self.selected_subtitle_id = "off"
                 self.pending_subtitle_id = None
@@ -454,6 +476,7 @@ class Bridge:
             if not path.exists():
                 raise RuntimeError("generated subtitle is not ready")
             with self.lock:
+                self.remember_subtitle_preference(("generated", track_id.removeprefix("generated-")))
                 self.subtitle = None
                 self.selected_subtitle_id = track_id
                 self.pending_subtitle_id = None
@@ -463,6 +486,7 @@ class Bridge:
         if not track:
             raise RuntimeError("subtitle track not found")
         with self.lock:
+            self.remember_subtitle_preference(subtitle_intent(track))
             self.subtitle = track["url"]
             self.selected_subtitle_id = track_id
             self.pending_subtitle_id = None
@@ -509,12 +533,23 @@ class Bridge:
                 "chapters": list(self.chapters),
                 "resume_us": self.resume_us,
                 "revision": self.revision,
+                "media_revision": self.media_revision,
+                "subtitle_preference": (
+                    list(self.subtitle_preference) if self.subtitle_preference else None
+                ),
                 "seek_us": int(self.position * 1_000_000),
                 "seek_revision": self.seek_revision,
                 "pending_subtitle_id": self.pending_subtitle_id,
             }
 
     def update_progress(self, body):
+        with self.lock:
+            if body.get("media_revision") is not None:
+                try:
+                    if int(body["media_revision"]) != self.media_revision:
+                        return
+                except (TypeError, ValueError):
+                    return
         try:
             pos = max(0.0, int(body.get("position_ns", 0)) / 1_000_000_000)
             dur = max(0.0, int(body.get("duration_ns", 0)) / 1_000_000_000)
@@ -557,6 +592,11 @@ class Bridge:
                 return False
             self.url = str(url)
             self.media_token = secrets.token_urlsafe(32)
+            self.subtitles = []
+            self.selected_subtitle_id = "off"
+            self.subtitle = None
+            self.pending_subtitle_id = None
+            self.properties["track-list"] = []
             self.position = float(options.get("start") or 0)
             self.resume_us = int(self.position * 1_000_000)
             if options.get("chapters-file"):
@@ -654,6 +694,7 @@ class Bridge:
                         mpv_id = -1
                     track = next((item for item in self.subtitles if item.get("mpv_id") == mpv_id), None)
                     if track:
+                        self.remember_subtitle_preference(subtitle_intent(track))
                         self.subtitle = track["url"]
                         self.selected_subtitle_id = track["id"]
             elif name == "referrer":
@@ -898,6 +939,8 @@ def launch_showtime(bridge, http_port):
         f"--env=MEDIA_PLAYER_SESSION_URL=http://127.0.0.1:{http_port}/api/session",
         f"--env=MEDIA_PLAYER_SESSION_TOKEN={bridge.token}",
     ]
+    if env.get("KUNAI_SHOWTIME_TRACE")=="1":
+        cmd.append("--env=KUNAI_SHOWTIME_TRACE=1")
     # Only grant host files explicitly selected for playback. The subtitle
     # generator runs in the host bridge; the Flatpak has no need for host:ro.
     for item in (bridge.url, bridge.subtitle):
@@ -918,6 +961,14 @@ def launch_showtime(bridge, http_port):
     # Showtime retrieves the media URL from authenticated /api/session itself.
     # Keep signed URLs and the loopback media bearer out of process argv.
     cmd += ["org.gnome.Showtime", str(SHOWTIME_BOOTSTRAP), "--new-window"]
+    debug_log=env.get("KUNAI_SHOWTIME_DEBUG_LOG")
+    if debug_log:
+        # Explicit diagnostics only. No default media URLs or credentials in logs.
+        log_path=Path(debug_log)
+        log_path.parent.mkdir(parents=True,exist_ok=True)
+        fd=os.open(str(log_path),os.O_CREAT | os.O_WRONLY | os.O_APPEND,0o600)
+        with os.fdopen(fd,"ab",buffering=0) as log:
+            return subprocess.Popen(cmd,env=env,stdout=log,stderr=log)
     return subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
