@@ -22,7 +22,11 @@ def test_bridge_load_seek_and_subtitles():
     b.handle_command(["loadfile", "https://example.invalid/b.m3u8", "replace", -1, {"start": "3"}])
     assert b.url.endswith("b.m3u8")
     assert b.position == 3
-    assert b.subtitle.endswith("en.vtt")
+    # The previous episode's VTT must never be attached to the next file.
+    assert b.subtitle is None
+    assert b.subtitle_preference == ("original", "en")
+    b.handle_command(["sub-add", "https://example.invalid/en2.vtt", "select", "English", "en"])
+    assert b.subtitle.endswith("en2.vtt")
     assert b.session()["next_episode"]
 
 

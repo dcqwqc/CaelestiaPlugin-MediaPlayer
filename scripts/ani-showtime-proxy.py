@@ -138,7 +138,7 @@ class Proxy:
                 tracks.append({
                     'id':f'original-{len(tracks)}',
                     'source':'original',
-                    'label':f'Original AniCLI {label}',
+                    'label':label,
                     'language':label,
                     'url':url,
                     'default':bool(item.get('default',False)),
@@ -146,7 +146,7 @@ class Proxy:
                 })
         if fallback and not tracks:
             tracks.append({
-                'id':'original-0','source':'original','label':'Original AniCLI Default',
+                'id':'original-0','source':'original','label':'Default',
                 'language':'Default','url':fallback,'default':True,'available':True,
             })
         return tracks

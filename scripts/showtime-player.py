@@ -23,7 +23,8 @@ import gi
 gi.require_version("Gtk","4.0")
 gi.require_version("Adw","1")
 gi.require_version("Gst","1.0")
-from gi.repository import Adw,Gio,GLib,Gtk,Pango,Gst
+gi.require_version("GstPlay","1.0")
+from gi.repository import Adw,Gio,GLib,Gtk,Pango,Gst,GstPlay
 GLib.set_prgname("showtime"); GLib.set_application_name(_("Video Player"))
 Gtk.Window.set_default_icon_name("org.gnome.Showtime")
 Gio.resources_register(Gio.Resource.load(str(Path(PKG_DATA_DIR,"showtime.gresource"))))
@@ -36,6 +37,7 @@ _original_position_updated=Window._on_position_updated
 _original_media_info_updated=Window._on_media_info_updated
 _original_end_of_stream=Window._on_end_of_stream
 _original_on_error=Window._on_error
+_original_playback_state_changed=Window._on_playback_state_changed
 _original_build_menus=Options.build_menus
 
 def _http_json(url,method="GET",payload=None,timeout=45):
@@ -447,7 +449,7 @@ def _rebuild_subtitle_menu(window):
     if generated_more.get_n_items():
         generated.append_submenu("More AI Languages",generated_more)
     if original.get_n_items():
-        menu.append_section("Original AniCLI",original)
+        menu.append_section("Original",original)
     if study_more.get_n_items():
         study.append_submenu("More Study Languages",study_more)
     if study.get_n_items():
@@ -525,20 +527,13 @@ def _set_session(window,session,refresh_menu=True):
     _apply_session_title(window,session)
     new_selected=str(session.get("selected_subtitle_id") or "off")
 
-    # Generic player bridges (not only ani-cli) can request an in-place seek.
-    # A monotonically increasing revision prevents the 1s session poll from
-    # replaying the same seek over and over.
+    # A seek received during an episode transition must wait until the target
+    # media is loaded. The old timeline may be longer than the new episode.
     seek_revision=int(session.get("seek_revision") or 0)
     if seek_revision and seek_revision!=getattr(window,"_external_seek_revision",0):
         window._external_seek_revision=seek_revision
         seek_us=max(0,int(session.get("seek_us") or 0))
-        def apply_external_seek():
-            try:
-                window.play.seek(seek_us*1000)
-            except Exception as exc:
-                print(f"MediaPlayer: external seek failed: {exc}",file=sys.stderr)
-            return GLib.SOURCE_REMOVE
-        GLib.timeout_add(30,apply_external_seek)
+        _schedule_media_seek(window,seek_us*1000,session.get("media_revision"))
 
     if new_episode!=old_episode:
         window._autoplay_cancelled=False
@@ -556,31 +551,6 @@ def _set_session(window,session,refresh_menu=True):
         else:
             _set_external_subtitle(window,session.get("subtitle_url"))
 
-    # On the first window load the video starts before /api/session arrives.
-    # Apply the controller's persisted per-episode position once, after GstPlay
-    # has had a moment to discover the stream.
-    if not old_episode and not getattr(window,"_initial_resume_scheduled",False):
-        window._initial_resume_scheduled=True
-        resume_us=int(session.get("resume_us") or 0)
-        revision=session.get("revision")
-        if resume_us>5_000_000:
-            window._initial_resume_pending=True
-            def initial_resume():
-                current=getattr(window,"_media_session",{}) or {}
-                if current.get("revision")!=revision:
-                    window._initial_resume_pending=False
-                    return GLib.SOURCE_REMOVE
-                try:
-                    window.play.seek(resume_us*1000)
-                    def release_progress():
-                        window._initial_resume_pending=False
-                        return GLib.SOURCE_REMOVE
-                    GLib.timeout_add(900,release_progress)
-                except Exception as exc:
-                    window._initial_resume_pending=False
-                    print(f"MediaPlayer: initial resume failed: {exc}",file=sys.stderr)
-                return GLib.SOURCE_REMOVE
-            GLib.timeout_add(650,initial_resume)
     if hasattr(window,"_episode_prev_button"):
         previous_episode=session.get("previous_episode")
         next_episode=session.get("next_episode")
@@ -630,6 +600,7 @@ def _post_progress(window):
         or getattr(window,"_progress_posting",False)
         or getattr(window,"_media_busy",False)
         or getattr(window,"_initial_resume_pending",False)
+        or not getattr(window,"_media_stream_ready",False)
     ):
         return GLib.SOURCE_CONTINUE
     try:
@@ -651,6 +622,7 @@ def _post_progress(window):
                     "duration_ns":duration_ns,
                     "episode":session.get("episode"),
                     "revision":session.get("revision"),
+                    "media_revision":session.get("media_revision"),
                 },
                 timeout=4,
             )
@@ -663,7 +635,72 @@ def _post_progress(window):
     threading.Thread(target=worker,daemon=True).start()
     return GLib.SOURCE_CONTINUE
 
+def _safe_seek_target_ns(request_ns,duration_ns):
+    """Discard stale/resume positions outside the *new* media's timeline."""
+    try:
+        request_ns=max(0,int(request_ns))
+        duration_ns=max(0,int(duration_ns or 0))
+    except (TypeError,ValueError):
+        return None
+    if request_ns<=0:
+        return None
+    # An old 22:30 resume must NOT seek to the end of a 21:58 episode.
+    if duration_ns and request_ns>=max(0,duration_ns-1_000_000_000):
+        return None
+    return request_ns
+
+
+def _schedule_media_seek(window,target_ns,media_revision):
+    """Apply a current generation's seek only once the new stream is seekable."""
+    generation=getattr(window,"_media_generation",0)
+    window._seek_request_serial=getattr(window,"_seek_request_serial",0)+1
+    serial=window._seek_request_serial
+    window._initial_resume_pending=True
+    attempts=0
+
+    def try_seek():
+        nonlocal attempts
+        current=getattr(window,"_media_session",{}) or {}
+        if (getattr(window,"_media_generation",0)!=generation
+                or getattr(window,"_seek_request_serial",0)!=serial
+                or current.get("media_revision")!=media_revision):
+            return GLib.SOURCE_REMOVE
+        attempts+=1
+        if not getattr(window,"_media_stream_ready",False):
+            if attempts<50:
+                return GLib.SOURCE_CONTINUE
+            window._initial_resume_pending=False
+            return GLib.SOURCE_REMOVE
+        duration_ns=int(getattr(window.play.props,"duration",0) or 0)
+        target=_safe_seek_target_ns(target_ns,duration_ns)
+        if target is None:
+            window._initial_resume_pending=False
+            return GLib.SOURCE_REMOVE
+        if not duration_ns:
+            if attempts<40:
+                return GLib.SOURCE_CONTINUE
+            window._initial_resume_pending=False
+            return GLib.SOURCE_REMOVE
+        try:
+            window.play.seek(target)
+            window._initial_resume_pending=False
+            return GLib.SOURCE_REMOVE
+        except Exception:
+            if attempts<50:
+                return GLib.SOURCE_CONTINUE
+            window._initial_resume_pending=False
+            print("MediaPlayer: seek unavailable for current media",file=sys.stderr)
+            return GLib.SOURCE_REMOVE
+    GLib.timeout_add(120,try_seek)
+
+
 def _play_session(window,session):
+    window._media_stream_ready=False
+    window._episode_autoplay_pending=True
+    window._media_generation=getattr(window,"_media_generation",0)+1
+    window._seek_request_serial=getattr(window,"_seek_request_serial",0)+1
+    window._initial_resume_pending=False
+    window._active_skip_chapter=None
     _set_session(window,session)
     subtitle_uri=session.get("subtitle_url")
     media_url=str(session.get("media_url") or "")
@@ -678,23 +715,14 @@ def _play_session(window,session):
         pass
     _original_play_video(window,Gio.File.new_for_uri(media_url))
     _set_external_subtitle(window,subtitle_uri)
-    resume_us=int(session.get("resume_us") or 0)
-    if resume_us>0:
-        window._initial_resume_pending=True
-        def resume():
-            try:
-                window.play.seek(resume_us*1000)
-                def release_progress():
-                    window._initial_resume_pending=False
-                    return GLib.SOURCE_REMOVE
-                GLib.timeout_add(900,release_progress)
-            except Exception:
-                window._initial_resume_pending=False
-            return GLib.SOURCE_REMOVE
-        GLib.timeout_add(650,resume)
+    resume_us=max(0,int(session.get("resume_us") or 0))
+    if resume_us>5_000_000:
+        _schedule_media_seek(window,resume_us*1000,session.get("media_revision"))
+
 
 def _navigate(window,direction):
     if not SESSION_BASE or getattr(window,"_media_busy",False): return
+    started_media_revision=(getattr(window,"_media_session",{}) or {}).get("media_revision")
     window._media_busy=True
     if hasattr(window,"_episode_prev_button"):
         window._episode_prev_button.set_sensitive(False); window._episode_next_button.set_sensitive(False)
@@ -709,10 +737,20 @@ def _navigate(window,direction):
         def finish():
             if error is not None:
                 window._media_busy=False
-                _toast(window,f"Could not load episode: {error}"); _refresh_session_async(window)
+                # When a controller reply races its session poll, the next
+                # episode may already be loaded. Refresh before ever presenting
+                # a failure to the user; only show unrecovered errors.
+                _refresh_session_async(window)
+                def report_if_unrecovered():
+                    current=(getattr(window,"_media_session",{}) or {})
+                    if current.get("media_revision")!=started_media_revision:
+                        return GLib.SOURCE_REMOVE
+                    _toast(window,"Could not load the next episode. Try again.")
+                    return GLib.SOURCE_REMOVE
+                GLib.timeout_add(2000,report_if_unrecovered)
                 return GLib.SOURCE_REMOVE
             try:
-                _play_session(window,session)
+                _set_session(window,session)
             except Exception as exc:
                 _toast(window,f"Could not switch episode: {exc}")
             window._media_busy=False
@@ -783,9 +821,16 @@ def _subtitle_action(window,action,parameter):
 
 def _skip_current_chapter(window):
     chapter=getattr(window,"_active_skip_chapter",None)
-    if not chapter: return
-    try: window.play.seek(int(float(chapter["end"])*1_000_000_000))
-    except Exception as exc: _toast(window,f"Could not skip: {exc}")
+    if not chapter or not getattr(window,"_media_stream_ready",False):
+        return
+    try:
+        duration_ns=int(getattr(window.play.props,"duration",0) or 0)
+        target=_safe_seek_target_ns(int(float(chapter["end"])*1_000_000_000),duration_ns)
+        if target is not None:
+            window.play.seek(target)
+    except Exception:
+        # A stale chapter is not a playback error; never flash a seek toast.
+        return
 
 def _cancel_autoplay(window):
     window._autoplay_cancelled=True
@@ -1027,8 +1072,32 @@ def _premium_play_video(self,gfile):
     _original_play_video(self,gfile)
     if subtitle_uri:
         _set_external_subtitle(self,subtitle_uri)
+    if SESSION_URL:
+        # The subtitle and video setup may both pause the underlying pipeline.
+        # Start the new video only after its subtitle source is attached.
+        self.unpause()
+
+def _premium_playback_state_changed(self,obj,state):
+    if os.environ.get("KUNAI_SHOWTIME_TRACE")=="1":
+        print(f"MediaPlayer trace: state-change {state}",file=sys.stderr,flush=True)
+    result=_original_playback_state_changed(self,obj,state)
+    if SESSION_URL:
+        if state==GstPlay.PlayState.PLAYING:
+            self._episode_autoplay_pending=False
+        elif (state==GstPlay.PlayState.PAUSED
+              and getattr(self,"_episode_autoplay_pending",False)
+              and getattr(self,"_media_stream_ready",False)):
+            # GstPlay may pause after an earlier 'play' command while replacing
+            # an existing URI. Reassert autoplay only once, after the new
+            # media is ready; never override a later user-initiated pause.
+            self._episode_autoplay_pending=False
+            self.unpause()
+    return result
 
 def _premium_media_info_updated(self,obj,media_info):
+    self._media_stream_ready=True
+    if os.environ.get("KUNAI_SHOWTIME_TRACE")=="1":
+        print("MediaPlayer trace: media info updated",file=sys.stderr,flush=True)
     if not SESSION_URL:
         _original_media_info_updated(self,obj,media_info)
         return
@@ -1060,18 +1129,20 @@ def _premium_on_error(self,obj,error):
     # its full-screen error page when Kunai is attempting a provider fallback.
     # Instead surface a concise, once-per-media hint and report the error to
     # Kunai's IPC adapter so it can move on to another available source.
+    if getattr(self,"_media_busy",False):
+        # Expected cancellation of the previous decode pipeline during a
+        # Next/Previous request; do not flash the old media's error screen.
+        return
     message=str(getattr(error,"message","") or "")
+    if os.environ.get("KUNAI_SHOWTIME_TRACE")=="1":
+        print("MediaPlayer trace: playback-error class=%s" % type(error).__name__,file=sys.stderr,flush=True)
     denied=_is_source_access_denied(message)
     session=getattr(self,"_media_session",{}) or {}
     revision=session.get("revision")
     media_revision=session.get("media_revision")
-    if denied:
-        error_key=(media_revision, session.get("media_url"))
-        if getattr(self,"_last_denied_source_error_key",None) != error_key:
-            self._last_denied_source_error_key=error_key
-            _toast(self,"Source rejected (HTTP 403). Choose another source in Kunai.")
-    else:
-        _original_on_error(self,obj,error)
+    # Show no transient player error: let Kunai handle source/provider
+    # recovery. A genuine terminal failure appears in Kunai if it cannot
+    # find any viable alternative. Never expose signed URLs in a toast.
     reason="access-denied" if denied else "playback-failed"
     def report():
         try:
@@ -1099,6 +1170,7 @@ Window._on_position_updated=_premium_position_updated
 Window._on_media_info_updated=_premium_media_info_updated
 Window._on_end_of_stream=_premium_end_of_stream
 Window._on_error=_premium_on_error
+Window._on_playback_state_changed=_premium_playback_state_changed
 Window._on_choose_subtitles=_premium_on_choose_subtitles
 Options.build_menus=_premium_build_menus
 
