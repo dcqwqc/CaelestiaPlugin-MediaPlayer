@@ -22,7 +22,8 @@ else:
 import gi
 gi.require_version("Gtk","4.0")
 gi.require_version("Adw","1")
-from gi.repository import Adw,Gio,GLib,Gtk,Pango
+gi.require_version("Gst","1.0")
+from gi.repository import Adw,Gio,GLib,Gtk,Pango,Gst
 GLib.set_prgname("showtime"); GLib.set_application_name(_("Video Player"))
 Gtk.Window.set_default_icon_name("org.gnome.Showtime")
 Gio.resources_register(Gio.Resource.load(str(Path(PKG_DATA_DIR,"showtime.gresource"))))
@@ -34,12 +35,16 @@ _original_play_video=Window.play_video
 _original_position_updated=Window._on_position_updated
 _original_media_info_updated=Window._on_media_info_updated
 _original_end_of_stream=Window._on_end_of_stream
+_original_on_error=Window._on_error
 _original_build_menus=Options.build_menus
 
 def _http_json(url,method="GET",payload=None,timeout=45):
     data=None; headers={"Accept":"application/json"}
     if payload is not None:
         data=json.dumps(payload).encode(); headers["Content-Type"]="application/json"
+    token=os.environ.get("MEDIA_PLAYER_SESSION_TOKEN","")
+    if token and SESSION_BASE and url.startswith(SESSION_BASE + "/api/"):
+        headers["X-Showtime-Session-Token"]=token
     req=urllib.request.Request(url,data=data,headers=headers,method=method)
     with urllib.request.urlopen(req,timeout=timeout) as response:
         value=json.loads(response.read().decode("utf-8","replace"))
@@ -478,8 +483,41 @@ def _apply_session_title(window,session=None):
     except Exception: pass
 
 
+def _session_needs_media_reload(previous,session):
+    """True only for a new media load, not a title, seek or subtitle change.
+
+    Kunai can reload the SAME URL after a 403/network error. An ordinary
+    session revision cannot identify that, so use bridge media_revision.
+    Legacy ani-cli session APIs have no media_revision: for those, a URL
+    change still indicates that Showtime must actually open the new file.
+    """
+    if not previous:
+        return False
+    old_media=previous.get("media_url")
+    new_media=session.get("media_url")
+    if not old_media or not new_media:
+        return False
+    new_revision=session.get("media_revision")
+    old_revision=previous.get("media_revision")
+    if new_revision is not None and old_revision is not None:
+        if new_revision != old_revision:
+            return True
+    return new_media != old_media
+
+
 def _set_session(window,session,refresh_menu=True):
     previous=getattr(window,"_media_session",{}) or {}
+    if os.environ.get("KUNAI_SHOWTIME_TRACE") == "1":
+        print(f"MediaPlayer trace: poll old_media_rev={previous.get('media_revision')} new_media_rev={session.get('media_revision')} old_rev={previous.get('revision')} new_rev={session.get('revision')}",file=sys.stderr,flush=True)
+    if _session_needs_media_reload(previous,session):
+        if os.environ.get("KUNAI_SHOWTIME_TRACE") == "1":
+            print("MediaPlayer trace: actually reloading media",file=sys.stderr,flush=True)
+        # Mark this media generation as current BEFORE _play_session, since
+        # _play_session calls _set_session to update all the normal UI fields.
+        # Otherwise those two functions recursively call each other forever.
+        window._media_session=session
+        _play_session(window,session)
+        return
     old_episode=str(previous.get("episode") or "")
     old_selected=str(previous.get("selected_subtitle_id") or "")
     window._media_session=session
@@ -564,7 +602,20 @@ def _refresh_session_async(window):
             session=None; print(f"MediaPlayer: session refresh failed: {exc}",file=sys.stderr)
         def finish():
             window._session_refreshing=False
-            if session is not None: _set_session(window,session)
+            if session is not None:
+                window._session_consecutive_failures=0
+                # The window launches without media arguments: never expose
+                # signed source URLs or bearer tokens in process argv.
+                # The first authenticated session supplies the URI to open.
+                if not getattr(window, "_media_session", None) and not window.play.props.uri:
+                    _play_session(window, session)
+                else:
+                    _set_session(window,session)
+            elif os.environ.get("MEDIA_PLAYER_SESSION_TOKEN"):
+                window._session_consecutive_failures=getattr(window,"_session_consecutive_failures",0)+1
+                if window._session_consecutive_failures>=3:
+                    app=window.get_application()
+                    if app: app.quit()
             return GLib.SOURCE_REMOVE
         GLib.idle_add(finish)
     threading.Thread(target=worker,daemon=True).start()
@@ -914,10 +965,57 @@ def _premium_init(self,**kwargs):
     _original_init(self,**kwargs)
     if SESSION_URL: _install_session_ui(self)
 
+def _install_video_request_headers(window, header_map):
+    """Apply resolved stream headers to the video URI source, not subtitle loads.
+
+    Showtime uses GstPlay/playbin3 and otherwise loses mpv's per-file headers.
+    In GStreamer the souphttpsrc element exposes these as extra-headers, while
+    urisourcebin creates the actual HTTP source deeper in its bin.
+    """
+    if not isinstance(header_map, dict) or not header_map:
+        return
+
+    def configure_source(element):
+        try:
+            extra = Gst.Structure.new_empty("headers")
+            has_extra = bool(element.find_property("extra-headers"))
+            for name, value in header_map.items():
+                if not isinstance(name, str) or not isinstance(value, str):
+                    continue
+                if name.lower() == "user-agent" and element.find_property("user-agent"):
+                    element.set_property("user-agent", value)
+                elif name.lower() == "cookie" and element.find_property("cookies"):
+                    element.set_property("cookies", [value])
+                elif has_extra:
+                    extra.set_value(name, value)
+            if has_extra and extra.n_fields() > 0:
+                element.set_property("extra-headers", extra)
+        except Exception as exc:
+            print(f"MediaPlayer: could not configure media headers: {type(exc).__name__}", file=sys.stderr)
+
+    def setup_cb(pipeline, source):
+        try:
+            pipeline.disconnect_by_func(setup_cb)
+        except Exception:
+            pass
+        configure_source(source)
+        # Some versions hand a urisourcebin to source-setup. Only observe this
+        # specific video source's descendants; never attach to the whole
+        # pipeline where subtitle requests could accidentally inherit cookies.
+        if isinstance(source, Gst.Bin):
+            source.connect("deep-element-added", lambda _bin, _sub_bin, element: configure_source(element))
+
+    window.pipeline.connect("source-setup", setup_cb)
+
+
 def _premium_play_video(self,gfile):
     subtitle_uri=INITIAL_SUBTITLE_URI
     session=getattr(self,"_media_session",{}) or {}
+    if not session and SESSION_URL:
+        try: session=_http_json(SESSION_URL,timeout=2)
+        except Exception: pass
     if session.get("subtitle_url"): subtitle_uri=str(session["subtitle_url"])
+    _install_video_request_headers(self,session.get("http_headers"))
     self._media_stream_ready=False
     self._pending_subtitle_uri=str(subtitle_uri or "")
     self._pending_subtitle_attached=False
@@ -945,6 +1043,45 @@ def _premium_position_updated(self,obj,pos):
         _update_subtitle_overlay(self,pos)
     if SESSION_URL: _update_timed_ui(self,pos)
 
+def _is_source_access_denied(message):
+    """Recognize upstream HTTP authorization denial, not codec failures."""
+    return bool(re.search(
+        r"(?:403|forbidden|not authorized to access|access denied|permission denied|unauthorized)",
+        str(message or ""), re.I,
+    ))
+
+
+def _premium_on_error(self,obj,error):
+    if not SESSION_BASE:
+        _original_on_error(self,obj,error)
+        return
+
+    # The 403 comes from the stream host. Showtime must not repeatedly flash
+    # its full-screen error page when Kunai is attempting a provider fallback.
+    # Instead surface a concise, once-per-media hint and report the error to
+    # Kunai's IPC adapter so it can move on to another available source.
+    message=str(getattr(error,"message","") or "")
+    denied=_is_source_access_denied(message)
+    session=getattr(self,"_media_session",{}) or {}
+    revision=session.get("revision")
+    media_revision=session.get("media_revision")
+    if denied:
+        error_key=(media_revision, session.get("media_url"))
+        if getattr(self,"_last_denied_source_error_key",None) != error_key:
+            self._last_denied_source_error_key=error_key
+            _toast(self,"Source rejected (HTTP 403). Choose another source in Kunai.")
+    else:
+        _original_on_error(self,obj,error)
+    reason="access-denied" if denied else "playback-failed"
+    def report():
+        try:
+            _http_json(f"{SESSION_BASE}/api/playback-error",method="POST",
+                       payload={"revision":revision, "media_revision":media_revision,
+                                "reason":reason},timeout=4)
+        except Exception as exc:
+            print(f"MediaPlayer: could not report playback failure: {exc}",file=sys.stderr)
+    threading.Thread(target=report,daemon=True).start()
+
 def _premium_end_of_stream(self,obj):
     session=getattr(self,"_media_session",{}) or {}
     if SESSION_URL and AUTOPLAY_DEFAULT and not getattr(self,"_autoplay_cancelled",False) and session.get("next_episode") and not getattr(self,"_media_busy",False):
@@ -961,8 +1098,18 @@ Window.play_video=_premium_play_video
 Window._on_position_updated=_premium_position_updated
 Window._on_media_info_updated=_premium_media_info_updated
 Window._on_end_of_stream=_premium_end_of_stream
+Window._on_error=_premium_on_error
 Window._on_choose_subtitles=_premium_on_choose_subtitles
 Options.build_menus=_premium_build_menus
 
 from showtime import main
+# The real Showtime application is a D-Bus singleton. Without NON_UNIQUE,
+# later Kunai invocations forward URLs to an old process with old session
+# headers, dead bridge ports and outdated controllers.
+_original_application_init = main.Application.__init__
+def _kunai_application_init(self):
+    _original_application_init(self)
+    if SESSION_URL:
+        self.set_flags(self.get_flags() | Gio.ApplicationFlags.NON_UNIQUE)
+main.Application.__init__ = _kunai_application_init
 raise SystemExit(main.main())

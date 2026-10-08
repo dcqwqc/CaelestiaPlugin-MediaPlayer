@@ -74,7 +74,7 @@ def test_generated_subtitle_catalog_and_selection():
         assert track["available"] is True
         session = b.select_subtitle("generated-en")
         assert session["selected_subtitle_id"] == "generated-en"
-        assert session["subtitle_url"].endswith("/api/subtitles/generated-en.vtt")
+        assert "/api/subtitles/generated-en.vtt?token=" in session["subtitle_url"]
         assert b.generated_bytes("generated-en").startswith(b"WEBVTT")
 
 
