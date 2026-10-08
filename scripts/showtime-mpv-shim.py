@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import secrets
 import json
 import os
 import re
@@ -19,8 +20,28 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from showtime_media_proxy import MEDIA_PREFIX, media_proxy_url, relay_request
 SHOWTIME_BOOTSTRAP = ROOT / "showtime-player.py"
 REAL_MPV = Path("/usr/bin/mpv")
+
+
+HEADER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
+DANGEROUS_HEADERS = {"host", "connection", "content-length", "transfer-encoding", "proxy-authorization"}
+
+def media_header_dict(values):
+    """Map provider headers to HTTPS headers with no request smuggling."""
+    result = {}
+    for item in values:
+        if not isinstance(item, str):
+            continue
+        name, sep, value = item.partition(":")
+        name, value = name.strip(), value.strip()
+        if (sep and HEADER_RE.fullmatch(name) and name.lower() not in DANGEROUS_HEADERS
+                and value and not any(c in value for c in (chr(10),chr(13)))):
+            result[name] = value
+    return result
 
 GENERATED_LANGUAGES = [
     ('en','English'),
@@ -167,12 +188,17 @@ def parse_ffmeta(path):
 
 class Bridge:
     def __init__(self, cfg):
+        self.token = secrets.token_urlsafe(32)
+        self.media_token = secrets.token_urlsafe(32)
+        self.media_proxy_port = None
         self.lock = threading.RLock()
         self.cond = threading.Condition(self.lock)
         self.clients = set()
         self.closed = False
         self.revision = 1
         self.media_revision = 1
+        self.failed_media_revision = None
+        self.access_denied_urls = set()
         self.seek_revision = 0
         self.url = cfg.get("url") or ""
         self.title = cfg.get("title") or "Video"
@@ -443,6 +469,10 @@ class Bridge:
             self.revision += 1
         return self.session()
 
+    def header_dict(self):
+        with self.lock:
+            return media_header_dict(self.http_headers)
+
     def session(self):
         with self.lock:
             selected = getattr(self, "selected_subtitle_id", "off")
@@ -451,10 +481,21 @@ class Bridge:
                 subtitle_url = None
             elif selected.startswith("generated-") and self.base_url:
                 if self.generated_bytes(selected) is not None:
-                    subtitle_url = f"{self.base_url}/api/subtitles/{urllib.parse.quote(selected)}.vtt"
+                    subtitle_url = (
+                        f"{self.base_url}/api/subtitles/{urllib.parse.quote(selected)}.vtt"
+                        f"?token={urllib.parse.quote(self.token)}"
+                    )
             return {
                 "ok": True,
-                "media_url": self.url,
+                "media_url": (
+                    media_proxy_url(self.url, self.media_proxy_port, self.media_token)
+                    if self.http_headers else None
+                ) or self.url,
+                "http_headers": (
+                    {} if self.http_headers and media_proxy_url(
+                        self.url, self.media_proxy_port, self.media_token
+                    ) else media_header_dict(self.http_headers)
+                ),
                 "anime_title": self.title,
                 "episode": "",
                 "previous_episode": self.prev_label if self.can_prev else None,
@@ -508,13 +549,19 @@ class Bridge:
         self.referrer = referrer
         self.http_headers = new_headers
         with self.cond:
+            if url in self.access_denied_urls:
+                self.broadcast({"event": "end-file", "reason": "error",
+                                "file_error": "kunai_access_denied"})
+                return False
             self.url = str(url)
+            self.media_token = secrets.token_urlsafe(32)
             self.position = float(options.get("start") or 0)
             self.resume_us = int(self.position * 1_000_000)
             if options.get("chapters-file"):
                 self.chapters = parse_ffmeta(options.get("chapters-file"))
             self.revision += 1
             self.media_revision += 1
+            self.failed_media_revision = None
             self.properties["filename"] = self.url
             self.properties["time-pos"] = self.position
             self.properties["playback-time"] = self.position
@@ -525,6 +572,33 @@ class Bridge:
         self.broadcast({"event": "file-loaded"})
         self.prop("time-pos", self.position)
         self.prop("playback-time", self.position)
+
+    def report_playback_error(self, body):
+        """Forward a current GStreamer failure into the mpv-IPC error stream."""
+        try:
+            revision = int(body.get("revision") or 0)
+            media_revision = int(body.get("media_revision") or 0)
+        except (TypeError, ValueError):
+            return False
+        with self.lock:
+            if media_revision and media_revision != self.media_revision:
+                return False
+            if not media_revision and revision and revision != self.revision:
+                return False
+            if self.failed_media_revision == self.media_revision:
+                return False
+            self.failed_media_revision = self.media_revision
+            denied = body.get("reason") == "access-denied"
+            if denied:
+                self.access_denied_urls.add(self.url)
+            self.properties["core-idle"] = True
+            self.properties["idle-active"] = True
+            self.properties["vo-configured"] = False
+        self.broadcast({
+            "event": "end-file", "reason": "error",
+            "file_error": "kunai_access_denied" if denied else "loading_failed",
+        })
+        return True
 
     def request_navigation(self, direction):
         with self.cond:
@@ -734,8 +808,23 @@ class HTTPHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def authorized(self):
+        if self.headers.get("X-Showtime-Session-Token") != self.bridge.token:
+            self.send_json({"ok": False, "error": "unauthorized"}, 403)
+            return False
+        return True
+
     def do_GET(self):
+        if self.path.startswith(MEDIA_PREFIX):
+            relay_request(self)
+            return
         u = urllib.parse.urlparse(self.path)
+        if u.path.startswith("/api/subtitles/") and u.path.endswith(".vtt"):
+            if urllib.parse.parse_qs(u.query).get("token") != [self.bridge.token]:
+                self.send_json({"ok": False, "error": "unauthorized"}, 403)
+                return
+        elif not self.authorized():
+            return
         if u.path == "/api/session":
             self.send_json(self.bridge.session())
             return
@@ -750,7 +839,13 @@ class HTTPHandler(BaseHTTPRequestHandler):
         self.send_json({"ok": False, "error": "not found"}, 404)
 
     def do_POST(self):
+        if not self.authorized():
+            return
         u = urllib.parse.urlparse(self.path)
+        if u.path == "/api/playback-error":
+            accepted = self.bridge.report_playback_error(self.read_json())
+            self.send_json({"ok": True, "accepted": accepted})
+            return
         if u.path == "/api/progress":
             self.bridge.update_progress(self.read_json())
             self.send_json({"ok": True})
@@ -800,6 +895,7 @@ def launch_showtime(bridge, http_port):
         f"--filesystem={ROOT}:ro",
         "--command=python3",
         f"--env=MEDIA_PLAYER_SESSION_URL=http://127.0.0.1:{http_port}/api/session",
+        f"--env=MEDIA_PLAYER_SESSION_TOKEN={bridge.token}",
     ]
     if bridge.subtitle:
         cmd.append(f"--env=MEDIA_PLAYER_SUBTITLE_URI={bridge.subtitle}")
@@ -819,6 +915,7 @@ def main(argv):
     httpd = HTTPServer(("127.0.0.1", 0), bridge)
     http_port = httpd.server_address[1]
     bridge.base_url = f"http://127.0.0.1:{http_port}"
+    bridge.media_proxy_port = http_port
     http_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     http_thread.start()
 
