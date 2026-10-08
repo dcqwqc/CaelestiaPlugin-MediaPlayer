@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import secrets
 import json
 import os
 import re
@@ -36,6 +37,8 @@ def parse_args(argv):
         "title": "Video",
         "subtitle": None,
         "referrer": "",
+        "user_agent": "",
+        "http_header_fields": "",
         "start": 0.0,
         "chapters_file": None,
         "persistent": False,
@@ -49,6 +52,10 @@ def parse_args(argv):
             state["subtitle"] = arg.split("=", 1)[1]
         elif arg.startswith("--referrer="):
             state["referrer"] = arg.split("=", 1)[1]
+        elif arg.startswith("--user-agent="):
+            state["user_agent"] = arg.split("=", 1)[1]
+        elif arg.startswith("--http-header-fields="):
+            state["http_header_fields"] = arg.split("=", 1)[1]
         elif arg.startswith("--start="):
             try:
                 state["start"] = float(arg.split("=", 1)[1])
@@ -98,19 +105,46 @@ def parse_ffmeta(path):
     return [x for x in out if x.get("type") in ("op", "ed", "recap", "preview")]
 
 
+
+HEADER_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
+FORBIDDEN_HEADERS = {"host", "connection", "content-length", "transfer-encoding", "proxy-authorization"}
+
+def normalize_media_headers(referrer="", user_agent="", fields=""):
+    """Preserve only provider-declared media request headers, without newlines."""
+    headers = {}
+    if isinstance(fields, str):
+        for chunk in fields.split(","):
+            name, sep, value = chunk.partition(":")
+            name = name.strip()
+            if sep and HEADER_NAME_RE.fullmatch(name) and name.lower() not in FORBIDDEN_HEADERS:
+                if value.strip() and not any(c in value for c in (chr(10),chr(13))):
+                    headers[name] = value.strip()
+    for key, value in (("Referer", referrer), ("User-Agent", user_agent)):
+        if isinstance(value, str) and value and not any(c in value for c in (chr(10),chr(13))):
+            headers[key] = value
+    return headers
+
+
 class Bridge:
     def __init__(self, cfg):
+        self.token = secrets.token_urlsafe(32)
         self.lock = threading.RLock()
         self.cond = threading.Condition(self.lock)
         self.clients = set()
         self.closed = False
         self.revision = 1
         self.media_revision = 1
+        self.failed_media_revision = None
+        # Only for this bridge process: HTTP 403 is an explicit upstream
+        # rejection, not a transient decoder error. Do not reopen denied
+        # resources repeatedly and make Showtime flash its error screen.
+        self.access_denied_urls = set()
         self.seek_revision = 0
         self.url = cfg.get("url") or ""
         self.title = cfg.get("title") or "Video"
         self.subtitle = cfg.get("subtitle")
         self.referrer = cfg.get("referrer") or ""
+        self.http_headers = normalize_media_headers(self.referrer, cfg.get("user_agent"), cfg.get("http_header_fields"))
         self.resume_us = int(float(cfg.get("start") or 0) * 1_000_000)
         self.chapters = parse_ffmeta(cfg.get("chapters_file"))
         self.position = float(cfg.get("start") or 0)
@@ -207,6 +241,7 @@ class Bridge:
             return {
                 "ok": True,
                 "media_url": self.url,
+                "http_headers": dict(self.http_headers),
                 "anime_title": self.title,
                 "episode": "",
                 "previous_episode": self.prev_label if self.can_prev else None,
@@ -218,6 +253,7 @@ class Bridge:
                 "chapters": list(self.chapters),
                 "resume_us": self.resume_us,
                 "revision": self.revision,
+                "media_revision": self.media_revision,
                 "seek_us": int(self.position * 1_000_000),
                 "seek_revision": self.seek_revision,
             }
@@ -243,14 +279,25 @@ class Bridge:
 
     def set_media(self, url, options=None):
         options = options or {}
+        url = str(url)
         with self.cond:
-            self.url = str(url)
+            if url in self.access_denied_urls:
+                # A prior load explicitly failed with HTTP 403. Keep Showtime
+                # on its existing stable error screen, but tell Kunai this
+                # attempted load has failed, so it can try a *different* source.
+                # Do not issue file-loaded or change the media generation.
+                self.broadcast({"event": "end-file", "reason": "error",
+                                "file_error": "kunai_access_denied"})
+                return False
+            self.url = url
+            self.http_headers = normalize_media_headers(options.get("referrer"), options.get("user-agent"), options.get("http-header-fields"))
             self.position = float(options.get("start") or 0)
             self.resume_us = int(self.position * 1_000_000)
             if options.get("chapters-file"):
                 self.chapters = parse_ffmeta(options.get("chapters-file"))
             self.revision += 1
             self.media_revision += 1
+            self.failed_media_revision = None
             self.properties["filename"] = self.url
             self.properties["time-pos"] = self.position
             self.properties["playback-time"] = self.position
@@ -261,6 +308,41 @@ class Bridge:
         self.broadcast({"event": "file-loaded"})
         self.prop("time-pos", self.position)
         self.prop("playback-time", self.position)
+        return True
+
+    def report_playback_error(self, body):
+        """Forward a real Showtime/GStreamer load failure to Kunai's mpv IPC.
+
+        Never include signed stream URLs or authentication parameters in the
+        event. Ignore stale/duplicate notifications after a source switch.
+        """
+        try:
+            reported_revision = int(body.get("revision") or 0)
+            reported_media_revision = int(body.get("media_revision") or 0)
+        except (ValueError, TypeError):
+            return False
+        with self.lock:
+            # Prefer media identity: a title change or seek may update the
+            # general session revision without changing the loaded video.
+            if reported_media_revision:
+                if reported_media_revision != self.media_revision:
+                    return False
+            elif reported_revision and reported_revision != self.revision:
+                return False
+            if self.failed_media_revision == self.media_revision:
+                return False
+            self.failed_media_revision = self.media_revision
+            if body.get("reason") == "access-denied":
+                self.access_denied_urls.add(self.url)
+            self.properties["core-idle"] = True
+            self.properties["idle-active"] = True
+            self.properties["vo-configured"] = False
+        # Use a specific synthetic file_error so Kunai can skip its same-URL
+        # reconnect ladder. An explicit 403/access denial cannot be repaired by
+        # reopening the identical resource; the app should advance source/provider.
+        file_error = "kunai_access_denied" if body.get("reason") == "access-denied" else "loading_failed"
+        self.broadcast({"event": "end-file", "reason": "error", "file_error": file_error})
+        return True
 
     def request_navigation(self, direction):
         with self.cond:
@@ -421,7 +503,15 @@ class HTTPHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def authorized(self):
+        if self.headers.get("X-Showtime-Session-Token") != self.bridge.token:
+            self.send_json({"ok": False, "error": "unauthorized"}, 403)
+            return False
+        return True
+
     def do_GET(self):
+        if not self.authorized():
+            return
         u = urllib.parse.urlparse(self.path)
         if u.path == "/api/session":
             self.send_json(self.bridge.session())
@@ -429,10 +519,16 @@ class HTTPHandler(BaseHTTPRequestHandler):
         self.send_json({"ok": False, "error": "not found"}, 404)
 
     def do_POST(self):
+        if not self.authorized():
+            return
         u = urllib.parse.urlparse(self.path)
         if u.path == "/api/progress":
             self.bridge.update_progress(self.read_json())
             self.send_json({"ok": True})
+            return
+        if u.path == "/api/playback-error":
+            accepted = self.bridge.report_playback_error(self.read_json())
+            self.send_json({"ok": True, "accepted": accepted})
             return
         if u.path == "/api/navigate":
             direction = (urllib.parse.parse_qs(u.query).get("direction") or ["next"])[0]
@@ -478,10 +574,18 @@ def launch_showtime(bridge, http_port):
         f"--filesystem={ROOT}:ro",
         "--command=python3",
         f"--env=MEDIA_PLAYER_SESSION_URL=http://127.0.0.1:{http_port}/api/session",
+        f"--env=MEDIA_PLAYER_SESSION_TOKEN={bridge.token}",
     ]
+    if env.get("KUNAI_SHOWTIME_TRACE") == "1":
+        cmd.append("--env=KUNAI_SHOWTIME_TRACE=1")
     if bridge.subtitle:
         cmd.append(f"--env=MEDIA_PLAYER_SUBTITLE_URI={bridge.subtitle}")
     cmd += ["org.gnome.Showtime", str(SHOWTIME_BOOTSTRAP), "--new-window", bridge.url]
+    debug_log = env.get("KUNAI_SHOWTIME_DEBUG_LOG")
+    if debug_log:
+        # Only enabled explicitly for local diagnostic runs.
+        with open(debug_log, "ab", buffering=0) as log:
+            return subprocess.Popen(cmd, env=env, stdout=log, stderr=log)
     return subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
