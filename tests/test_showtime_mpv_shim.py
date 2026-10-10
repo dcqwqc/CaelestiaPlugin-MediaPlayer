@@ -168,3 +168,54 @@ def test_subtitle_ids_remain_stable_across_removals_and_sid_off():
     b.handle_command(["set_property", "sid", "no"])
     assert b.subtitle is None
     assert b.selected_subtitle_id == "off"
+
+
+def test_only_vixsrc_hls_uses_native_backend():
+    m = load_shim()
+    assert m.is_vixsrc_native_fallback_url(
+        "https://vixsrc.to/playlist/475052?token=secret"
+    )
+    assert not m.is_vixsrc_native_fallback_url(
+        "https://vixsrc.to/embed/475052?token=secret"
+    )
+    assert not m.is_vixsrc_native_fallback_url(
+        "https://vixsrc.to.evil.example/playlist/475052"
+    )
+    assert not m.is_vixsrc_native_fallback_url(
+        "https://vidrock.net/movie/612654"
+    )
+    assert not m.is_vixsrc_native_fallback_url("file:///etc/passwd")
+    assert not m.is_vixsrc_native_fallback_url(None)
+
+
+def test_vixsrc_player_uses_wayland_shm_without_overriding_other_sources():
+    m = load_shim()
+    args = [
+        "--input-ipc-server=/run/user/1000/kunai/test.sock",
+        "--http-header-fields=Referer: https://vixsrc.to/",
+        "https://vixsrc.to/playlist/475052?token=secret",
+    ]
+    cmd = m.vixsrc_native_player_command(args, {"WAYLAND_DISPLAY": "wayland-1"})
+    assert cmd[:4] == ["/usr/bin/mpv", "--no-config", "--vo=wlshm", "--hwdec=no"]
+    assert cmd[4:] == args
+    assert m.vixsrc_native_player_command(args, {}) == ["/usr/bin/mpv", "--no-config", *args]
+
+
+def test_vixsrc_main_dispatch_uses_native_and_other_hosts_use_showtime():
+    m = load_shim()
+    calls = []
+    native_call = m.subprocess.call
+    original_bridge = m.Bridge
+    original_launch = m.launch_showtime
+    try:
+        m.subprocess.call = lambda argv: (calls.append(argv), 0)[1]
+        args = ["https://vixsrc.to/playlist/475052?token=secret"]
+        assert m.main(args) == 0
+        assert calls and calls[0][0] == "/usr/bin/mpv"
+        assert "--no-config" in calls[0]
+        assert calls[0][-1] == args[-1]
+        assert not m.is_vixsrc_native_fallback_url("https://vidrock.net/playlist/475052")
+    finally:
+        m.subprocess.call = native_call
+        m.Bridge = original_bridge
+        m.launch_showtime = original_launch

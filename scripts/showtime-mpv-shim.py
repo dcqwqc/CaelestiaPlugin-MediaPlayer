@@ -976,8 +976,32 @@ def launch_showtime(bridge, http_port):
     return subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def is_vixsrc_native_fallback_url(url):
+    """Use native mpv only for VixSrc HLS that currently stalls in GstPlay."""
+    if not isinstance(url, str):
+        return False
+    parsed = urllib.parse.urlsplit(url)
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname == "vixsrc.to"
+        and re.fullmatch(r"/playlist/[0-9]+", parsed.path) is not None
+    )
+
+
+def vixsrc_native_player_command(argv, env=None):
+    """Keep GPU-problematic Hyprland playback on the tested Wayland SHM path."""
+    environment = env if env is not None else os.environ
+    prefix = [str(REAL_MPV), "--no-config"]
+    if environment.get("WAYLAND_DISPLAY"):
+        prefix += ["--vo=wlshm", "--hwdec=no"]
+    return [*prefix, *argv]
+
+
 def main(argv):
     cfg = parse_args(argv)
+    if is_vixsrc_native_fallback_url(cfg.get("url")):
+        # Do not touch Showtime for any other host or non-playback mpv command.
+        return subprocess.call(vixsrc_native_player_command(argv))
     if cfg.get("passthrough"):
         return subprocess.call([str(REAL_MPV), *argv])
     if not cfg.get("url"):
