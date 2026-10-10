@@ -64,7 +64,24 @@ def test_parse_args_keeps_kunai_http_headers_for_ai_input():
     assert "Referer: https://ref.example/" in b.http_headers
 
 
-def test_generated_subtitle_catalog_and_selection():
+def test_space_user_agent_survives_initial_launch_and_episode_handoff():
+    m = load_shim()
+    cfg = m.parse_args([
+        "--user-agent= ",
+        "https://cdn.example/movie.m3u8",
+    ])
+    bridge = m.Bridge(cfg)
+    assert bridge.header_dict()["User-Agent"] == " "
+    bridge.handle_command([
+        "loadfile", "https://cdn.example/next.m3u8", "replace", -1,
+        {"user-agent": " "},
+    ])
+    assert bridge.header_dict()["User-Agent"] == " "
+    assert m.media_header_dict(["User-Agent:  ", "Origin: https://example.invalid"])[
+        "User-Agent"
+    ] == " "
+
+
     m = load_shim()
     b = m.Bridge({"url": "https://example.invalid/a.m3u8", "title": "Demo Episode"})
     with tempfile.TemporaryDirectory() as td:

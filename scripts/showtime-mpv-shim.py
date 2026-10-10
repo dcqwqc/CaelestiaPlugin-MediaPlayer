@@ -40,7 +40,10 @@ def media_header_dict(values):
         if not isinstance(item, str):
             continue
         name, sep, value = item.partition(":")
-        name, value = name.strip(), value.strip()
+        name = name.strip()
+        # VidRock/ngcorp requires the intentional one-space User-Agent.
+        # Stripping it makes urllib add its normal UA, which the CDN rejects.
+        value = " " if name.lower() == "user-agent" and value and not value.strip() else value.strip()
         if (sep and HEADER_RE.fullmatch(name) and name.lower() not in DANGEROUS_HEADERS
                 and value and not any(c in value for c in (chr(10),chr(13)))):
             result[name] = value
@@ -572,7 +575,8 @@ class Bridge:
         options = options or {}
         new_headers = []
         referrer = str(options.get("referrer") or "").strip()
-        user_agent = str(options.get("user-agent") or "").strip()
+        raw_user_agent = str(options.get("user-agent") or "")
+        user_agent = " " if raw_user_agent and not raw_user_agent.strip() else raw_user_agent.strip()
         header_fields = str(options.get("http-header-fields") or "").strip()
         if referrer:
             self.referrer = referrer
