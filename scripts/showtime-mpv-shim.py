@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from showtime_media_proxy import MEDIA_PREFIX, media_proxy_url, relay_request
+from showtime_vixsrc_hls import VIX_PREFIX, is_vixsrc_hls, handle_vixsrc_hls_request
 from showtime_subtitle_preference import (
     should_select_new_track, subtitle_intent, load_preference, save_preference,
 )
@@ -515,15 +516,19 @@ class Bridge:
             return {
                 "ok": True,
                 "media_url": (
-                    media_proxy_url(self.url, self.media_proxy_port, self.media_token)
-                    if self.http_headers else None
-                ) or (
-                    Path(self.url).resolve().as_uri() if self.url.startswith("/") else self.url
+                    f"http://127.0.0.1:{self.media_proxy_port}{VIX_PREFIX}{self.media_token}/master.m3u8"
+                    if self.media_proxy_port and is_vixsrc_hls(self.url)
+                    else (
+                        media_proxy_url(self.url, self.media_proxy_port, self.media_token)
+                        if self.http_headers else None
+                    ) or (
+                        Path(self.url).resolve().as_uri() if self.url.startswith("/") else self.url
+                    )
                 ),
                 "http_headers": (
-                    {} if self.http_headers and media_proxy_url(
+                    {} if is_vixsrc_hls(self.url) or (self.http_headers and media_proxy_url(
                         self.url, self.media_proxy_port, self.media_token
-                    ) else media_header_dict(self.http_headers)
+                    )) else media_header_dict(self.http_headers)
                 ),
                 "anime_title": self.title,
                 "episode": "",
@@ -861,7 +866,16 @@ class HTTPHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def do_HEAD(self):
+        if self.path.startswith(VIX_PREFIX):
+            handle_vixsrc_hls_request(self)
+            return
+        self.send_error(404, "no such media route")
+
     def do_GET(self):
+        if self.path.startswith(VIX_PREFIX):
+            handle_vixsrc_hls_request(self)
+            return
         if self.path.startswith(MEDIA_PREFIX):
             relay_request(self)
             return
@@ -976,32 +990,8 @@ def launch_showtime(bridge, http_port):
     return subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def is_vixsrc_native_fallback_url(url):
-    """Use native mpv only for VixSrc HLS that currently stalls in GstPlay."""
-    if not isinstance(url, str):
-        return False
-    parsed = urllib.parse.urlsplit(url)
-    return (
-        parsed.scheme == "https"
-        and parsed.hostname == "vixsrc.to"
-        and re.fullmatch(r"/playlist/[0-9]+", parsed.path) is not None
-    )
-
-
-def vixsrc_native_player_command(argv, env=None):
-    """Keep GPU-problematic Hyprland playback on the tested Wayland SHM path."""
-    environment = env if env is not None else os.environ
-    prefix = [str(REAL_MPV), "--no-config"]
-    if environment.get("WAYLAND_DISPLAY"):
-        prefix += ["--vo=wlshm", "--hwdec=no"]
-    return [*prefix, *argv]
-
-
 def main(argv):
     cfg = parse_args(argv)
-    if is_vixsrc_native_fallback_url(cfg.get("url")):
-        # Do not touch Showtime for any other host or non-playback mpv command.
-        return subprocess.call(vixsrc_native_player_command(argv))
     if cfg.get("passthrough"):
         return subprocess.call([str(REAL_MPV), *argv])
     if not cfg.get("url"):
