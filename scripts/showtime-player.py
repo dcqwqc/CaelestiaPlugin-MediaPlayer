@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """GNOME Showtime launcher extended for ani-cli episode sessions."""
 from __future__ import annotations
-import bisect, gettext, html, json, locale, os, re, signal, sys, threading, urllib.parse, urllib.request
+import bisect, gettext, html, json, locale, os, re, signal, sys, threading, urllib.parse, urllib.request, uuid, weakref
 from pathlib import Path
 from platform import system
 
@@ -28,6 +28,7 @@ from gi.repository import Adw,Gio,GLib,Gtk,Pango,Gst,GstPlay
 GLib.set_prgname("showtime"); GLib.set_application_name(_("Video Player"))
 Gtk.Window.set_default_icon_name("org.gnome.Showtime")
 Gio.resources_register(Gio.Resource.load(str(Path(PKG_DATA_DIR,"showtime.gresource"))))
+from showtime.play import Messenger
 from showtime.widgets.options import Options
 from showtime.widgets.window import Window
 
@@ -39,6 +40,80 @@ _original_end_of_stream=Window._on_end_of_stream
 _original_on_error=Window._on_error
 _original_playback_state_changed=Window._on_playback_state_changed
 _original_build_menus=Options.build_menus
+
+# Messenger drops the URI when translating GstPlay messages to UI signals.
+# Filter BEFORE that translation: delayed old errors, EOS and positions must
+# never acquire the new session's media_revision or affect its UI.
+_SESSION_WINDOWS = weakref.WeakValueDictionary()
+_original_play_bus_message = Messenger._on_play_bus_message
+
+
+def _generation_uri(uri):
+    # URI fragments are local identity only: HTTP never sends them to a CDN.
+    # Gst file sources also ignore the fragment when opening the file.
+    parts = urllib.parse.urlsplit(uri)
+    if parts.scheme:
+        return urllib.parse.urlunsplit(parts._replace(fragment="kunai-" + uuid.uuid4().hex))
+    return uri
+
+
+def _report_decoder_event(window, endpoint, reason=None):
+    session = dict(getattr(window, "_media_session", {}) or {})
+    if not SESSION_BASE or session.get("media_revision") is None:
+        return
+    payload = {"media_revision": session["media_revision"]}
+    if reason:
+        payload["reason"] = reason
+    def worker():
+        try:
+            _http_json(f"{SESSION_BASE}/api/{endpoint}", method="POST", payload=payload, timeout=4)
+        except Exception as exc:
+            print(f"MediaPlayer: decoder report failed: {type(exc).__name__}", file=sys.stderr)
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _guarded_play_bus_message(messenger, bus, message):
+    window = _SESSION_WINDOWS.get(bus)
+    if window is None or not SESSION_URL:
+        return _original_play_bus_message(messenger, bus, message)
+    expected = getattr(window, "_decoder_uri", None)
+    try:
+        uri = GstPlay.play_message_get_uri(message)
+        kind = GstPlay.play_message_parse_type(message)
+    except Exception:
+        return  # Older GstPlay without identity support cannot prove readiness.
+    if not expected or uri != expected:
+        return
+    if kind == GstPlay.PlayMessage.STATE_CHANGED:
+        state = GstPlay.play_message_parse_state_changed(message)
+        window._decoder_state = state.value_nick.lower()
+        window._decoder_pause_revision = (getattr(window,"_media_session",{}) or {}).get("pause_revision",0)
+    elif kind == GstPlay.PlayMessage.MEDIA_INFO_UPDATED:
+        info = GstPlay.play_message_parse_media_info_updated(message)
+        window._decoder_video_streams = info.get_number_of_video_streams()
+        window._decoder_audio_streams = info.get_number_of_audio_streams()
+        window._decoder_seekable = info.is_seekable()
+    elif kind == GstPlay.PlayMessage.POSITION_UPDATED:
+        window._decoder_position = GstPlay.play_message_parse_position_updated(message)
+    elif kind == GstPlay.PlayMessage.DURATION_CHANGED:
+        window._decoder_duration = GstPlay.play_message_parse_duration_changed(message)
+    elif kind == GstPlay.PlayMessage.SEEK_DONE:
+        window._decoder_position = GstPlay.play_message_parse_seek_done(message)
+        window._initial_resume_pending = False
+    elif kind == GstPlay.PlayMessage.ERROR:
+        error, _details = GstPlay.play_message_parse_error(message)
+        window._decoder_state = "failed"
+        _report_decoder_event(window, "playback-error",
+                              "access-denied" if _is_source_access_denied(error.message) else "playback-failed")
+    elif kind == GstPlay.PlayMessage.END_OF_STREAM:
+        _report_decoder_event(window, "playback-eof")
+    result = _original_play_bus_message(messenger, bus, message)
+    if kind == GstPlay.PlayMessage.POSITION_UPDATED:
+        _post_progress(window)
+    return result
+
+
+Messenger._on_play_bus_message = _guarded_play_bus_message
 
 def _http_json(url,method="GET",payload=None,timeout=45):
     data=None; headers={"Accept":"application/json"}
@@ -509,6 +584,17 @@ def _session_needs_media_reload(previous,session):
 
 def _set_session(window,session,refresh_menu=True):
     previous=getattr(window,"_media_session",{}) or {}
+    if (session.get("media_revision") is not None and previous.get("media_revision") is not None
+            and session["media_revision"] < previous["media_revision"]):
+        return
+    if (session.get("media_revision") == previous.get("media_revision")
+            and session.get("revision", 0) < previous.get("revision", 0)):
+        return
+    if "pause" in session and session.get("pause") != previous.get("pause"):
+        if session["pause"]:
+            window.pause()
+        else:
+            window.unpause()
     if os.environ.get("KUNAI_SHOWTIME_TRACE") == "1":
         print(f"MediaPlayer trace: poll old_media_rev={previous.get('media_revision')} new_media_rev={session.get('media_revision')} old_rev={previous.get('revision')} new_rev={session.get('revision')}",file=sys.stderr,flush=True)
     if _session_needs_media_reload(previous,session):
@@ -520,6 +606,8 @@ def _set_session(window,session,refresh_menu=True):
         window._media_session=session
         _play_session(window,session)
         return
+    if session.get("playback_terminal") and not previous.get("playback_terminal"):
+        window.play.stop()
     old_episode=str(previous.get("episode") or "")
     old_selected=str(previous.get("selected_subtitle_id") or "")
     window._media_session=session
@@ -604,12 +692,17 @@ def _post_progress(window):
     ):
         return GLib.SOURCE_CONTINUE
     try:
-        position_ns=int(window.play.props.position)
-        duration_ns=int(window.play.props.duration)
+        position_ns=int(getattr(window,"_decoder_position",0))
+        duration_ns=int(getattr(window,"_decoder_duration",0))
+        if duration_ns == Gst.CLOCK_TIME_NONE:
+            duration_ns=0
         session=dict(getattr(window,"_media_session",{}) or {})
+        decoder_state=getattr(window,"_decoder_state","loading")
+        pause_revision=getattr(window,"_decoder_pause_revision",0)
+        video_streams=getattr(window,"_decoder_video_streams",0)
+        audio_streams=getattr(window,"_decoder_audio_streams",0)
+        seekable=getattr(window,"_decoder_seekable",False)
     except Exception:
-        return GLib.SOURCE_CONTINUE
-    if position_ns<=0:
         return GLib.SOURCE_CONTINUE
     window._progress_posting=True
     def worker():
@@ -623,6 +716,12 @@ def _post_progress(window):
                     "episode":session.get("episode"),
                     "revision":session.get("revision"),
                     "media_revision":session.get("media_revision"),
+                    "seek_revision":session.get("seek_revision", 0),
+                    "state":decoder_state,
+                    "pause_revision":pause_revision,
+                    "video_streams":video_streams,
+                    "audio_streams":audio_streams,
+                    "seekable":seekable,
                 },
                 timeout=4,
             )
@@ -638,11 +737,11 @@ def _post_progress(window):
 def _safe_seek_target_ns(request_ns,duration_ns):
     """Discard stale/resume positions outside the *new* media's timeline."""
     try:
-        request_ns=max(0,int(request_ns))
+        request_ns=int(request_ns)
         duration_ns=max(0,int(duration_ns or 0))
     except (TypeError,ValueError):
         return None
-    if request_ns<=0:
+    if request_ns<0:
         return None
     # An old 22:30 resume must NOT seek to the end of a 21:58 episode.
     if duration_ns and request_ns>=max(0,duration_ns-1_000_000_000):
@@ -671,19 +770,31 @@ def _schedule_media_seek(window,target_ns,media_revision):
                 return GLib.SOURCE_CONTINUE
             window._initial_resume_pending=False
             return GLib.SOURCE_REMOVE
+        if getattr(window,"_decoder_seekable",True) is False:
+            window._initial_resume_pending=False
+            return GLib.SOURCE_REMOVE
         duration_ns=int(getattr(window.play.props,"duration",0) or 0)
+        if duration_ns == 18446744073709551615:  # Gst.CLOCK_TIME_NONE
+            duration_ns=0
         target=_safe_seek_target_ns(target_ns,duration_ns)
         if target is None:
             window._initial_resume_pending=False
             return GLib.SOURCE_REMOVE
-        if not duration_ns:
+        if not duration_ns and not getattr(window,"_decoder_seekable",False):
             if attempts<40:
                 return GLib.SOURCE_CONTINUE
             window._initial_resume_pending=False
             return GLib.SOURCE_REMOVE
         try:
             window.play.seek(target)
-            window._initial_resume_pending=False
+            # GstPlay.seek() queues an asynchronous operation. Resume progress
+            # only on the current URI's SEEK_DONE, with a bounded fallback.
+            def seek_timeout():
+                if (getattr(window,"_media_generation",0)==generation
+                        and getattr(window,"_seek_request_serial",0)==serial):
+                    window._initial_resume_pending=False
+                return GLib.SOURCE_REMOVE
+            GLib.timeout_add(6000,seek_timeout)
             return GLib.SOURCE_REMOVE
         except Exception:
             if attempts<50:
@@ -695,12 +806,21 @@ def _schedule_media_seek(window,target_ns,media_revision):
 
 
 def _play_session(window,session):
+    try:
+        audio = window.play.get_current_audio_track()
+        if audio and audio.get_language():
+            window._preferred_audio_language = audio.get_language()
+    except Exception:
+        pass
     window._media_stream_ready=False
     window._episode_autoplay_pending=True
     window._media_generation=getattr(window,"_media_generation",0)+1
     window._seek_request_serial=getattr(window,"_seek_request_serial",0)+1
     window._initial_resume_pending=False
     window._active_skip_chapter=None
+    window._custom_subtitle_active=False
+    window._custom_subtitle=None
+    window._autoplay_cancelled=False
     _set_session(window,session)
     subtitle_uri=session.get("subtitle_url")
     media_url=str(session.get("media_url") or "")
@@ -713,7 +833,21 @@ def _play_session(window,session):
         window.play.props.suburi=None
     except Exception:
         pass
-    _original_play_video(window,Gio.File.new_for_uri(media_url))
+    _install_video_request_headers(window, session.get("http_headers"))
+    window._decoder_position=0
+    window._decoder_duration=0
+    window._decoder_seekable=False
+    window._decoder_state="loading"
+    window._decoder_video_streams=0
+    window._decoder_audio_streams=0
+    window._decoder_uri=_generation_uri(media_url)
+    _original_play_video(window,Gio.File.new_for_uri(window._decoder_uri))
+    # Gio canonicalizes file URIs and strips fragments; restore identity on
+    # GstPlay itself before playing (filesrc ignores that fragment).
+    if window.play.props.uri != window._decoder_uri:
+        window.play.props.uri = window._decoder_uri
+    if not session.get("pause", False):
+        window.unpause()
     _set_external_subtitle(window,subtitle_uri)
     resume_us=max(0,int(session.get("resume_us") or 0))
     if resume_us>5_000_000:
@@ -1008,6 +1142,7 @@ def _premium_on_choose_subtitles(self,dialog,res):
 
 def _premium_init(self,**kwargs):
     _original_init(self,**kwargs)
+    _SESSION_WINDOWS[self.play.get_message_bus()] = self
     if SESSION_URL: _install_session_ui(self)
 
 def _install_video_request_headers(window, header_map):
@@ -1017,10 +1152,21 @@ def _install_video_request_headers(window, header_map):
     In GStreamer the souphttpsrc element exposes these as extra-headers, while
     urisourcebin creates the actual HTTP source deeper in its bin.
     """
+    window._media_header_generation = getattr(window, "_media_header_generation", 0) + 1
+    generation = window._media_header_generation
+    for obj, handler in getattr(window, "_media_header_handlers", []):
+        try:
+            if obj.handler_is_connected(handler):
+                obj.disconnect(handler)
+        except Exception:
+            pass
+    window._media_header_handlers = []
     if not isinstance(header_map, dict) or not header_map:
         return
 
     def configure_source(element):
+        if window._media_header_generation != generation:
+            return
         try:
             extra = Gst.Structure.new_empty("headers")
             has_extra = bool(element.find_property("extra-headers"))
@@ -1039,6 +1185,8 @@ def _install_video_request_headers(window, header_map):
             print(f"MediaPlayer: could not configure media headers: {type(exc).__name__}", file=sys.stderr)
 
     def setup_cb(pipeline, source):
+        if window._media_header_generation != generation:
+            return
         try:
             pipeline.disconnect_by_func(setup_cb)
         except Exception:
@@ -1048,9 +1196,11 @@ def _install_video_request_headers(window, header_map):
         # specific video source's descendants; never attach to the whole
         # pipeline where subtitle requests could accidentally inherit cookies.
         if isinstance(source, Gst.Bin):
-            source.connect("deep-element-added", lambda _bin, _sub_bin, element: configure_source(element))
+            handler = source.connect("deep-element-added", lambda _bin, _sub_bin, element: configure_source(element))
+            window._media_header_handlers.append((source, handler))
 
-    window.pipeline.connect("source-setup", setup_cb)
+    handler = window.pipeline.connect("source-setup", setup_cb)
+    window._media_header_handlers.append((window.pipeline, handler))
 
 
 def _premium_play_video(self,gfile):
@@ -1069,7 +1219,16 @@ def _premium_play_video(self,gfile):
         self.play.props.suburi=None
     except Exception:
         pass
-    _original_play_video(self,gfile)
+    self._decoder_position=0
+    self._decoder_duration=0
+    self._decoder_seekable=False
+    self._decoder_state="loading"
+    self._decoder_video_streams=0
+    self._decoder_audio_streams=0
+    self._decoder_uri=_generation_uri(gfile.get_uri())
+    _original_play_video(self,Gio.File.new_for_uri(self._decoder_uri))
+    if self.play.props.uri != self._decoder_uri:
+        self.play.props.uri = self._decoder_uri
     if subtitle_uri:
         _set_external_subtitle(self,subtitle_uri)
     if SESSION_URL:
@@ -1086,7 +1245,8 @@ def _premium_playback_state_changed(self,obj,state):
             self._episode_autoplay_pending=False
         elif (state==GstPlay.PlayState.PAUSED
               and getattr(self,"_episode_autoplay_pending",False)
-              and getattr(self,"_media_stream_ready",False)):
+              and getattr(self,"_media_stream_ready",False)
+              and not (getattr(self,"_media_session",{}) or {}).get("pause",False)):
             # GstPlay may pause after an earlier 'play' command while replacing
             # an existing URI. Reassert autoplay only once, after the new
             # media is ready; never override a later user-initiated pause.
@@ -1096,6 +1256,13 @@ def _premium_playback_state_changed(self,obj,state):
 
 def _premium_media_info_updated(self,obj,media_info):
     self._media_stream_ready=True
+    preferred=getattr(self,"_preferred_audio_language",None)
+    if preferred:
+        for track in media_info.get_audio_streams():
+            if track.get_language()==preferred:
+                self.play.set_audio_track(track.get_index())
+                self._preferred_audio_language=None
+                break
     if os.environ.get("KUNAI_SHOWTIME_TRACE")=="1":
         print("MediaPlayer trace: media info updated",file=sys.stderr,flush=True)
     if not SESSION_URL:
@@ -1125,33 +1292,9 @@ def _premium_on_error(self,obj,error):
         _original_on_error(self,obj,error)
         return
 
-    # The 403 comes from the stream host. Showtime must not repeatedly flash
-    # its full-screen error page when Kunai is attempting a provider fallback.
-    # Instead surface a concise, once-per-media hint and report the error to
-    # Kunai's IPC adapter so it can move on to another available source.
-    if getattr(self,"_media_busy",False):
-        # Expected cancellation of the previous decode pipeline during a
-        # Next/Previous request; do not flash the old media's error screen.
-        return
-    message=str(getattr(error,"message","") or "")
-    if os.environ.get("KUNAI_SHOWTIME_TRACE")=="1":
-        print("MediaPlayer trace: playback-error class=%s" % type(error).__name__,file=sys.stderr,flush=True)
-    denied=_is_source_access_denied(message)
-    session=getattr(self,"_media_session",{}) or {}
-    revision=session.get("revision")
-    media_revision=session.get("media_revision")
-    # Show no transient player error: let Kunai handle source/provider
-    # recovery. A genuine terminal failure appears in Kunai if it cannot
-    # find any viable alternative. Never expose signed URLs in a toast.
-    reason="access-denied" if denied else "playback-failed"
-    def report():
-        try:
-            _http_json(f"{SESSION_BASE}/api/playback-error",method="POST",
-                       payload={"revision":revision, "media_revision":media_revision,
-                                "reason":reason},timeout=4)
-        except Exception as exc:
-            print(f"MediaPlayer: could not report playback failure: {exc}",file=sys.stderr)
-    threading.Thread(target=report,daemon=True).start()
+    # The guarded GstPlay bus reports the current source's error exactly once.
+    # Leave provider recovery to Kunai without exposing signed source URLs.
+    return
 
 def _premium_end_of_stream(self,obj):
     session=getattr(self,"_media_session",{}) or {}

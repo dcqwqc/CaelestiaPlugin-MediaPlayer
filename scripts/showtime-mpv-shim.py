@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import secrets
 import json
+import math
 import os
 import re
 import signal
@@ -219,7 +220,9 @@ class Bridge:
         self.chapters = parse_ffmeta(cfg.get("chapters_file"))
         self.position = float(cfg.get("start") or 0)
         self.duration = 0.0
+        self._reset_decoder()
         self.paused = False
+        self.pause_revision = 0
         self.can_next = bool(cfg.get("persistent"))
         self.can_prev = bool(cfg.get("persistent"))
         self.next_label = "Next Episode"
@@ -231,15 +234,17 @@ class Bridge:
             "percent-pos": 0.0,
             "pause": False,
             "seeking": False,
+            "seekable": False,
             "paused-for-cache": False,
-            "cache-buffering-state": 100.0,
-            "demuxer-cache-duration": 30.0,
+            "cache-buffering-state": 0.0,
+            "demuxer-cache-duration": 0.0,
             "demuxer-via-network": self.url.startswith(("http://", "https://")),
             "cache-speed": 0.0,
-            "vo-configured": True,
+            "vo-configured": False,
+            "user-data/kunai-readiness": "pending",
             "eof-reached": False,
             "idle-active": False,
-            "core-idle": False,
+            "core-idle": True,
             "filename": self.url,
             "media-title": self.title,
             "track-list": [],
@@ -547,109 +552,179 @@ class Bridge:
                 ),
                 "seek_us": int(self.position * 1_000_000),
                 "seek_revision": self.seek_revision,
+                "pause": self.paused,
+                "pause_revision": self.pause_revision,
+                "playback_terminal": self.decoder_terminal,
                 "pending_subtitle_id": self.pending_subtitle_id,
             }
 
+    def _reset_decoder(self):
+        self.decoder_started = time.monotonic()
+        self.decoder_last_progress = self.decoder_started
+        self.decoder_sample = None
+        self.decoder_ready = False
+        self.decoder_terminal = False
+        self.decoder_state = "loading"
+
+    def _current_report(self, body):
+        # Missing identity is not evidence for the current source. Check under
+        # the same lock as ALL mutations and broadcasts (including replacement).
+        return (isinstance(body, dict)
+                and type(body.get("media_revision")) is int
+                and body["media_revision"] == self.media_revision
+                and not self.decoder_terminal)
+
     def update_progress(self, body):
         with self.lock:
-            if body.get("media_revision") is not None:
-                try:
-                    if int(body["media_revision"]) != self.media_revision:
-                        return
-                except (TypeError, ValueError):
-                    return
-        try:
-            pos = max(0.0, int(body.get("position_ns", 0)) / 1_000_000_000)
-            dur = max(0.0, int(body.get("duration_ns", 0)) / 1_000_000_000)
-        except Exception:
-            return
+            if not self._current_report(body):
+                return False
+            try:
+                pos = float(body["position_ns"]) / 1e9
+                dur = float(body.get("duration_ns", 0)) / 1e9
+                video_streams = int(body.get("video_streams", 0))
+                audio_streams = int(body.get("audio_streams", 0))
+                if min(video_streams, audio_streams) < 0:
+                    return False
+                if not all(math.isfinite(x) and 0 <= x < 1e10 for x in (pos, dur)):
+                    return False
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return False
+            # A queued sample from before a seek must not overwrite its target
+            # or serve as proof that the new timeline is advancing.
+            if body.get("seek_revision", 0) != self.seek_revision:
+                return False
+            now = time.monotonic()
+            state = body.get("state", "loading")
+            previous = self.decoder_sample
+            advancing = (state == "playing" and previous is not None
+                         and 0.05 <= pos - previous[0] <= now - previous[1] + 1.0)
+            self.decoder_sample = (pos, now) if state == "playing" else None
+            self.decoder_state = state
+            if advancing:
+                self.decoder_last_progress = now
+            # GstPlay exposes timeline progress, not rendered-frame delivery.
+            # Never promote this fallback into vo-configured/rendered evidence.
+            if (not self.decoder_ready and advancing
+                    and (video_streams > 0 or audio_streams > 0)):
+                self.decoder_ready = True
+                self.prop("core-idle", False)
+                self.prop("idle-active", False)
+                self.prop("user-data/kunai-readiness", "position-progress")
+                self.broadcast({"event": "file-loaded"})
+                self.broadcast({"event": "playback-restart"})
+            self.prop("seeking", False)
+            self.prop("seekable", body.get("seekable") is True)
+            self.position, self.duration = pos, dur
+            self.prop("time-pos", pos)
+            self.prop("playback-time", pos)
+            self.prop("duration", dur)
+            self.prop("percent-pos", pos / dur * 100 if dur else 0.0)
+            if (self.decoder_ready and state in ("playing", "paused")
+                    and body.get("pause_revision", 0) == self.pause_revision):
+                self.paused = state == "paused"
+            self.prop("pause", self.paused)
+            self.prop("paused-for-cache", state == "buffering")
+            if self.decoder_ready:
+                self.prop("core-idle", state != "playing")
+            return True
+
+    def check_watchdog(self, now=None):
         with self.lock:
-            self.position = pos
-            self.duration = dur
-            self.properties["time-pos"] = pos
-            self.properties["playback-time"] = pos
-            self.properties["duration"] = dur
-            self.properties["percent-pos"] = (pos / dur * 100.0) if dur > 0 else 0.0
-        self.prop("time-pos", pos)
-        self.prop("playback-time", pos)
-        self.prop("duration", dur)
-        if dur > 0:
-            self.prop("percent-pos", pos / dur * 100.0)
+            now = time.monotonic() if now is None else now
+            if self.closed or self.decoder_terminal:
+                return False
+            if self.paused or (self.decoder_ready and self.decoder_state == "paused"):
+                self.decoder_started = now
+                self.decoder_last_progress = now
+                self.decoder_sample = None
+                return False
+            expired = (now - self.decoder_last_progress > 30 if self.decoder_ready
+                       else now - self.decoder_started > 45)
+            if expired:
+                return self.report_playback_error({
+                    "media_revision": self.media_revision, "reason": "decode-timeout"})
+            return False
+
+    def report_eof(self, body):
+        with self.lock:
+            if not self._current_report(body):
+                return False
+            if not self.decoder_ready:
+                return self.report_playback_error(body)
+            self.decoder_terminal = True
+            self.prop("eof-reached", True)
+            self.prop("core-idle", True)
+            self.prop("idle-active", True)
+            self.broadcast({"event": "end-file", "reason": "eof"})
+            return True
 
     def set_media(self, url, options=None):
         options = options or {}
-        new_headers = []
-        referrer = str(options.get("referrer") or "").strip()
-        raw_user_agent = str(options.get("user-agent") or "")
-        user_agent = " " if raw_user_agent and not raw_user_agent.strip() else raw_user_agent.strip()
-        header_fields = str(options.get("http-header-fields") or "").strip()
-        if referrer:
-            self.referrer = referrer
-            new_headers.append("Referer: " + referrer)
-        elif self.referrer:
-            new_headers.append("Referer: " + self.referrer)
-        if user_agent:
-            new_headers.append("User-Agent: " + user_agent)
-        if header_fields:
-            new_headers.extend(x.strip() for x in header_fields.split(",") if x.strip())
-        self.referrer = referrer
-        self.http_headers = new_headers
         with self.cond:
-            if url in self.access_denied_urls:
-                self.broadcast({"event": "end-file", "reason": "error",
-                                "file_error": "kunai_access_denied"})
-                return False
+            new_headers = []
+            referrer = str(options.get("referrer") or "").strip()
+            raw_user_agent = str(options.get("user-agent") or "")
+            user_agent = " " if raw_user_agent and not raw_user_agent.strip() else raw_user_agent.strip()
+            if referrer:
+                new_headers.append("Referer: " + referrer)
+            if user_agent:
+                new_headers.append("User-Agent: " + user_agent)
+            new_headers.extend(x.strip() for x in str(options.get("http-header-fields") or "").split(",") if x.strip())
+            self.referrer = referrer
+            self.http_headers = new_headers
+            if not self.decoder_terminal:
+                self.broadcast({"event": "end-file", "reason": "stop"})
             self.url = str(url)
             self.media_token = secrets.token_urlsafe(32)
             self.subtitles = []
             self.selected_subtitle_id = "off"
             self.subtitle = None
             self.pending_subtitle_id = None
-            self.properties["track-list"] = []
+            self.prop("track-list", [])
             self.position = float(options.get("start") or 0)
             self.resume_us = int(self.position * 1_000_000)
-            if options.get("chapters-file"):
-                self.chapters = parse_ffmeta(options.get("chapters-file"))
             self.revision += 1
             self.media_revision += 1
             self.failed_media_revision = None
+            self._reset_decoder()
+            self.duration = 0.0
+            self.seek_revision = 0
+            self.chapters = parse_ffmeta(options.get("chapters-file"))
+            for name, value in (("vo-configured", False), ("core-idle", True),
+                                ("idle-active", False), ("duration", 0.0),
+                                ("percent-pos", 0.0), ("paused-for-cache", False),
+                                ("seeking", False), ("seekable", False), ("eof-reached", False),
+                                ("user-data/kunai-readiness", "pending")):
+                self.prop(name, value)
             self.properties["filename"] = self.url
             self.properties["time-pos"] = self.position
             self.properties["playback-time"] = self.position
             self.properties["eof-reached"] = False
             self.cond.notify_all()
-        self.prop("filename", self.url)
-        self.prop("media-title", self.title)
-        self.broadcast({"event": "file-loaded"})
-        self.prop("time-pos", self.position)
-        self.prop("playback-time", self.position)
+            self.prop("filename", self.url)
+            self.prop("media-title", self.title)
+            self.prop("time-pos", self.position)
+            self.prop("playback-time", self.position)
 
     def report_playback_error(self, body):
         """Forward a current GStreamer failure into the mpv-IPC error stream."""
-        try:
-            revision = int(body.get("revision") or 0)
-            media_revision = int(body.get("media_revision") or 0)
-        except (TypeError, ValueError):
-            return False
         with self.lock:
-            if media_revision and media_revision != self.media_revision:
-                return False
-            if not media_revision and revision and revision != self.revision:
-                return False
-            if self.failed_media_revision == self.media_revision:
+            if not self._current_report(body):
                 return False
             self.failed_media_revision = self.media_revision
+            self.decoder_terminal = True
             denied = body.get("reason") == "access-denied"
             if denied:
                 self.access_denied_urls.add(self.url)
-            self.properties["core-idle"] = True
-            self.properties["idle-active"] = True
-            self.properties["vo-configured"] = False
-        self.broadcast({
-            "event": "end-file", "reason": "error",
-            "file_error": "kunai_access_denied" if denied else "loading_failed",
-        })
-        return True
+            self.prop("core-idle", True)
+            self.prop("idle-active", True)
+            self.prop("vo-configured", False)
+            self.prop("user-data/kunai-readiness", "failed")
+            self.broadcast({
+                "event": "end-file", "reason": "error",
+                "file_error": "kunai_access_denied" if denied else "loading_failed",
+            })
+            return True
 
     def request_navigation(self, direction):
         with self.cond:
@@ -659,7 +734,10 @@ class Bridge:
         # Kunai's mpv Lua bridge normally stops the current file itself after
         # publishing this request. Showtime replaces that Lua surface, so emit
         # the same end-file signal here and let Kunai resolve the adjacent episode.
-        self.broadcast({"event": "end-file", "reason": "stop"})
+        with self.lock:
+            if not self.decoder_terminal:
+                self.decoder_terminal = True
+                self.broadcast({"event": "end-file", "reason": "stop"})
         deadline = time.monotonic() + 48
         with self.cond:
             while self.media_revision <= before and not self.closed and time.monotonic() < deadline:
@@ -667,6 +745,10 @@ class Bridge:
             return self.media_revision > before
 
     def handle_command(self, command):
+        with self.lock:
+            return self._handle_command(command)
+
+    def _handle_command(self, command):
         if not isinstance(command, list) or not command:
             return None
         op = str(command[0])
@@ -682,6 +764,8 @@ class Bridge:
             value = command[2] if len(command) > 2 else None
             if name == "pause":
                 self.paused = bool(value)
+                self.pause_revision += 1
+                self.revision += 1
                 self.prop("pause", self.paused)
             elif name == "force-media-title":
                 self.title = str(value or "Video")
@@ -736,12 +820,24 @@ class Bridge:
         if op == "seek" and len(command) > 1:
             try:
                 pos = float(command[1])
-            except Exception:
-                pos = self.position
-            with self.lock:
-                self.position = pos
-                self.seek_revision += 1
-                self.revision += 1
+                mode = str(command[2]) if len(command) > 2 else "relative"
+                if "percent" in mode:
+                    if self.duration <= 0:
+                        return None
+                    pos *= self.duration / 100
+                if not mode.startswith("absolute"):
+                    pos += self.position
+                if not math.isfinite(pos):
+                    return None
+                pos = max(0.0, pos)
+            except (ValueError, TypeError):
+                return None
+            self.position = pos
+            self.decoder_sample = None
+            self.decoder_last_progress = time.monotonic()
+            self.seek_revision += 1
+            self.revision += 1
+            self.prop("seeking", True)
             self.prop("time-pos", pos)
             self.prop("playback-time", pos)
             return None
@@ -776,9 +872,13 @@ class Bridge:
         if op == "sub-reload":
             return None
         if op == "stop":
+            self.decoder_terminal = True
+            self.prop("idle-active", True)
+            self.prop("core-idle", True)
             self.broadcast({"event": "end-file", "reason": "stop"})
             return None
         if op == "quit":
+            self.decoder_terminal = True
             self.closed = True
             self.broadcast({"event": "end-file", "reason": "quit"})
             return "quit"
@@ -870,6 +970,9 @@ class HTTPHandler(BaseHTTPRequestHandler):
         if self.path.startswith(VIX_PREFIX):
             handle_vixsrc_hls_request(self)
             return
+        if self.path.startswith(MEDIA_PREFIX):
+            relay_request(self)
+            return
         self.send_error(404, "no such media route")
 
     def do_GET(self):
@@ -906,6 +1009,9 @@ class HTTPHandler(BaseHTTPRequestHandler):
         if u.path == "/api/playback-error":
             accepted = self.bridge.report_playback_error(self.read_json())
             self.send_json({"ok": True, "accepted": accepted})
+            return
+        if u.path == "/api/playback-eof":
+            self.send_json({"ok": True, "accepted": self.bridge.report_eof(self.read_json())})
             return
         if u.path == "/api/progress":
             self.bridge.update_progress(self.read_json())
@@ -1015,6 +1121,11 @@ def main(argv):
         ipc_thread = threading.Thread(target=ipcd.serve_forever, daemon=True)
         ipc_thread.start()
 
+    def watchdog():
+        while not bridge.closed:
+            bridge.check_watchdog()
+            time.sleep(0.5)
+    threading.Thread(target=watchdog, daemon=True).start()
     proc = launch_showtime(bridge, http_port)
     try:
         code = proc.wait()
@@ -1028,7 +1139,13 @@ def main(argv):
         for ai_proc in ai_processes:
             if ai_proc.poll() is None:
                 ai_proc.terminate()
-        bridge.broadcast({"event": "end-file", "reason": "quit"})
+        with bridge.lock:
+            if not bridge.decoder_terminal:
+                if code:
+                    bridge.report_playback_error({"media_revision": bridge.media_revision})
+                else:
+                    bridge.decoder_terminal = True
+                    bridge.broadcast({"event": "end-file", "reason": "quit"})
         with bridge.cond:
             bridge.cond.notify_all()
         httpd.shutdown()
