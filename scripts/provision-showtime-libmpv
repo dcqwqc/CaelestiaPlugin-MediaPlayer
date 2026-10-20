@@ -20,7 +20,10 @@ def provision(args):
         raise RuntimeError('Destination exists; choose a new versioned directory')
     # Verify against the system distributor keyring; a key supplied beside the
     # package is not a trust anchor. gpgv does not fetch keys or change trust.
-    subprocess.run(['gpgv', '--keyring', str(args.keyring.resolve()),
+    # Arch's distribution keyring is ASCII-armored: gpgv --keyring cannot
+    # read it directly. pacman-key verifies against the existing trusted
+    # distribution key database without importing or trusting new keys.
+    subprocess.run(['pacman-key', '--verify',
                     str(args.signature.resolve()), str(args.mpv_package.resolve())],
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     location = Path(subprocess.check_output(
@@ -29,13 +32,18 @@ def provision(args):
         ['flatpak', 'info', '--show-commit', 'org.gnome.Showtime'], text=True).strip()
     source = location / 'files'
     package = source / 'share/showtime'
-    init = (package / 'showtime/__init__.py').read_text()
+    matches = sorted((source / 'lib').glob('python*/site-packages/showtime/__init__.py'))
+    if len(matches) != 1:
+        raise RuntimeError('Cannot locate installed Showtime Python package')
+    upstream_py = matches[0].parent
+    init = (upstream_py / '__init__.py').read_text()
     if not ('VERSION = "50.0"' in init or "VERSION = '50.0'" in init):
         raise RuntimeError('Requires installed GNOME Showtime 50.0')
     args.destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.showtime-stage-', dir=args.destination.parent) as temp:
         stage = Path(temp)
         shutil.copytree(package, stage / 'share/showtime', ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        shutil.copytree(upstream_py, stage / 'share/showtime/showtime', ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
         (stage / 'schemas').mkdir()
         schemas = list((source / 'share/glib-2.0/schemas').glob('org.gnome.Showtime*.gschema.xml'))
         if not schemas: raise RuntimeError('Showtime schemas missing')
