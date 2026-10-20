@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# One Showtime window, using libmpv for decoding/network/track control.
+# Explicit SHOWTIME_BACKEND=gstreamer restores the previous GStreamer backend.
+set -euo pipefail
+self="$(readlink -f -- "${BASH_SOURCE[0]}")"
+root="$(cd -- "$(dirname -- "$self")" && pwd)"
+export SHOWTIME_HOST_RUNTIME="${SHOWTIME_HOST_RUNTIME:-$HOME/.local/share/showtime-libmpv/50.0-20261020}"
+if [[ -z "${SHOWTIME_BACKEND+x}" ]]; then
+  # A damaged/unavailable native runtime must never turn playback into a dead
+  # launcher. Use the existing Showtime Flatpak instead.
+  if /usr/bin/python3 - "$root" <<'PY' >/dev/null 2>&1
+import os
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from showtime_host import host_command, preflight
+runtime = Path(os.environ['SHOWTIME_HOST_RUNTIME'])
+command, environment = host_command(
+    Path(sys.argv[1]) / 'showtime-player.py',
+    'http://127.0.0.1:1/api/session',
+    'startup-check-only',
+    {'SHOWTIME_HOST_RUNTIME': str(runtime), **os.environ},
+)
+preflight(command, environment)
+PY
+  then export SHOWTIME_BACKEND=libmpv
+  else export SHOWTIME_BACKEND=gstreamer
+  fi
+fi
+exec /usr/bin/python3 "$root/showtime-mpv-shim.py" "$@"

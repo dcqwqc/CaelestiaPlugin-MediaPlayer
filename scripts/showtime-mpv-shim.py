@@ -1074,6 +1074,9 @@ def launch_showtime(bridge, http_port):
     env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={runtime}/bus")
     cmd = [
         "flatpak", "run",
+        # Select the installed release branch explicitly rather than relying
+        # on environment-specific default branch selection.
+        "--branch=stable",
         "--share=network",
         f"--filesystem={ROOT}:ro",
         "--command=python3",

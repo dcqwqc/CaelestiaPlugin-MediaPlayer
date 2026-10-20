@@ -1,9 +1,46 @@
 # Showtime 50 native backend: release validation
 
-Status: implemented, opt-in, **not approved for default rollout**. GStreamer
-remains the default and rollback. No deployment or remote machine interaction
-is part of this change. This repository ships integration Python, not a fork
+Status (Mirai, 2026-10-20): **enabled through the user-local Showtime
+launcher** after an isolated full-window playback acceptance run. Existing
+GStreamer remains an explicit rollback. Other devices are not automatically
+configured. This is not a claim of universal provider/DRM compatibility. This repository ships integration Python, not a fork
 of Showtime's assets or a replacement window.
+
+## Mirai release verification and rollback
+
+On Mirai, the ~/.local/bin/mpv symlink points to
+scripts/showtime-mpv-launcher. For real playback it selects the embedded
+libmpv backend after verifying the installed runtime manifest and host
+GI/GTK/libadwaita/libmpv ABI. If either fails, new sessions fall back to the
+original Showtime GStreamer Flatpak. SHOWTIME_BACKEND=gstreamer always
+overrides native selection; SHOWTIME_BACKEND=libmpv explicitly forces native.
+
+The installed runtime is user-local under
+~/.local/share/showtime-libmpv/50.0-20261020, provisioned from the installed
+Showtime 50 Flatpak and an Arch-signed python-mpv module. No system libraries
+were copied from the Flatpak into the host loader path. The original Flatpak
+was not replaced.
+
+**Actual installed-launcher test:** in a private Xvfb and private D-Bus session
+using synthetic 35-second H.264/AAC test content on Mirai, the deployed
+~/.local/bin/mpv launched the original Showtime 50 UI and rendered video.
+Kunai's IPC reported rendered-frame-progress after native output and advancing
+position. Pause, absolute seek to 4.0 s, resume, and a loadfile switch to a
+second synthetic video all passed; readiness reset to pending for the new
+source and returned only after new frames advanced. No original playback session
+was stopped or altered during this test.
+
+The explicit GStreamer rollback also opened the existing Flatpak in an
+isolated session, advanced video, paused, sought and resumed. Its preexisting
+source-switching path did not pass the native readiness assertion, so the
+GStreamer path is a functional fallback, not an equivalent backend. The private
+test sets FLATPAK_USER_DIR to the existing user install because the private
+XDG_DATA_HOME would otherwise hide it.
+
+**Remaining limits:** actual Wayland/Hyprland rendering, audible audio output,
+MPRIS end-to-end, hardware decode, streaming services and DRM have not all
+been certified in this release. No claims of universal playback support should
+be made from synthetic media alone.
 
 ## Implementation and runtime boundaries
 
