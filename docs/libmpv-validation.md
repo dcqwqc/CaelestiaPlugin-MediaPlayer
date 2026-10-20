@@ -30,6 +30,16 @@ second synthetic video all passed; readiness reset to pending for the new
 source and returned only after new frames advanced. No original playback session
 was stopped or altered during this test.
 
+**Authenticated HLS end-to-end check:** the same deployed Showtime launcher
+decoded a locally generated 35-second HLS playlist over HTTP, sending an
+explicit source-specific authorization header for every manifest and segment.
+A loopback test server recorded 14 authorized requests (12 media segments),
+zero unauthorized requests, advancing rendered-frame readiness, pause, seek,
+resume, and verified readiness after switching from HLS to a second video.
+This proves native HLS/header handling for that synthetic source; cross-origin
+CDN credential policies and external provider availability remain separate
+verification requirements.
+
 The explicit GStreamer rollback also opened the existing Flatpak in an
 isolated session, advanced video, paused, sought and resumed. Its preexisting
 source-switching path did not pass the native readiness assertion, so the
