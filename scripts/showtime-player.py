@@ -5,7 +5,10 @@ import bisect, gettext, html, json, locale, os, re, signal, sys, threading, urll
 from pathlib import Path
 from platform import system
 
-PKG_DATA_DIR="/app/share/showtime"
+BACKEND=os.environ.get("SHOWTIME_BACKEND", "gstreamer")
+if BACKEND not in ("gstreamer", "libmpv"):
+    raise SystemExit("Unsupported SHOWTIME_BACKEND")
+PKG_DATA_DIR=os.environ.get("SHOWTIME_DATA_DIR", "/app/share/showtime")
 LOCALE_DIR="/app/share/locale"
 SESSION_URL=os.environ.get("MEDIA_PLAYER_SESSION_URL","").strip()
 SESSION_BASE=SESSION_URL.rsplit("/api/session",1)[0] if SESSION_URL else ""
@@ -31,6 +34,7 @@ Gio.resources_register(Gio.Resource.load(str(Path(PKG_DATA_DIR,"showtime.gresour
 from showtime.play import Messenger
 from showtime.widgets.options import Options
 from showtime.widgets.window import Window
+import showtime.widgets.window as _window_module
 
 _original_init=Window.__init__
 _original_play_video=Window.play_video
@@ -130,7 +134,13 @@ def _http_json(url,method="GET",payload=None,timeout=45):
     if token and SESSION_BASE and url.startswith(SESSION_BASE + "/api/"):
         headers["X-Showtime-Session-Token"]=token
     req=urllib.request.Request(url,data=data,headers=headers,method=method)
-    with urllib.request.urlopen(req,timeout=timeout) as response:
+    open_url=urllib.request.urlopen
+    if "X-Showtime-Session-Token" in headers:
+        class NoSessionRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *_args, **_kwargs):
+                return None
+        open_url=urllib.request.build_opener(NoSessionRedirect()).open
+    with open_url(req,timeout=timeout) as response:
         value=json.loads(response.read().decode("utf-8","replace"))
     if not isinstance(value,dict): raise RuntimeError("session controller returned invalid JSON")
     if value.get("ok") is False: raise RuntimeError(str(value.get("error") or "session controller error"))
@@ -259,8 +269,13 @@ def _apply_subtitle_cues(window,cues):
 
 
 def _set_external_subtitle(window,uri):
-    """Load controller VTT into the GTK overlay; never touch GstPlay suburi."""
+    """Use native subtitle decoding for mpv, or the existing GTK VTT overlay."""
     _clear_study_overlay(window)
+    if BACKEND == "libmpv":
+        _apply_subtitle_cues(window, [])
+        window.play.fetch_subtitle(str(uri) if uri else None)
+        if not uri: window.play.set_subtitle_track_enabled(False)
+        return
     window._pending_subtitle_uri=str(uri or "")
     try:
         window.play.set_subtitle_track_enabled(False)
@@ -279,7 +294,7 @@ def _set_external_subtitle(window,uri):
         _apply_subtitle_cues(window,cues)
     except Exception as exc:
         _apply_subtitle_cues(window,[])
-        print(f"MediaPlayer: subtitle overlay load failed: {exc}",file=sys.stderr)
+        print(f"MediaPlayer: subtitle overlay load failed: {type(exc).__name__}",file=sys.stderr)
 
 def _update_subtitle_overlay(window,pos_ns):
     label=getattr(window,"_subtitle_label",None)
@@ -325,6 +340,9 @@ def _apply_study_payload(window,payload):
     window._study_starts=[x['start_ns'] for x in cues]
     window._study_last_index=-2
     window._study_active=True
+    if BACKEND == 'libmpv':
+        window.play.fetch_subtitle(None)
+        window.play.set_subtitle_track_enabled(False)
     window._study_meta={
         'japanese_source':str(payload.get('japanese_source') or 'Japanese'),
         'natural_source':str(payload.get('natural_source') or 'Original subtitle'),
@@ -342,7 +360,7 @@ def _set_study_subtitle(window,uri):
         _apply_study_payload(window,payload)
     except Exception as exc:
         _clear_study_overlay(window)
-        _toast(window,f'Could not load study subtitles: {exc}')
+        _toast(window,f'Could not load study subtitles: {type(exc).__name__}')
 
 
 def _label_markup(label,text,size='small',weight=None,dim=False):
@@ -543,6 +561,14 @@ def _rebuild_subtitle_menu(window):
         custom_menu=Gio.Menu()
         custom_menu.append_item(_menu_item(f"Custom · {custom['name']}","win.media-subtitle","custom-local"))
         menu.append_section("Custom",custom_menu)
+    if BACKEND == "libmpv":
+        info = window.play.get_media_info()
+        if info:
+            embedded = Gio.Menu()
+            for index, track in enumerate(info.get_subtitle_streams()):
+                embedded.append(track.get_language() or f"Track {index + 1}",
+                                f"win.select-subtitles(uint16 {index})")
+            if embedded.get_n_items(): menu.append_section("Embedded", embedded)
     menu.append("Add Subtitle File…","win.choose-subtitles")
 
 
@@ -557,6 +583,11 @@ def _apply_session_title(window,session=None):
     if not display_title:
         return
     window._session_display_title=display_title
+    if BACKEND == "libmpv":
+        info = window.play.get_media_info()
+        if info and info.get_title() != display_title:
+            info.title = display_title
+            window.emit("media-info-updated")
     try:
         if window.title_label.props.label!=display_title:
             window.title_label.props.label=display_title
@@ -664,9 +695,10 @@ def _refresh_session_async(window):
     def worker():
         try: session=_http_json(SESSION_URL,timeout=4)
         except Exception as exc:
-            session=None; print(f"MediaPlayer: session refresh failed: {exc}",file=sys.stderr)
+            session=None; print(f"MediaPlayer: session refresh failed: {type(exc).__name__}",file=sys.stderr)
         def finish():
             window._session_refreshing=False
+            if getattr(window.play, "closed", False): return GLib.SOURCE_REMOVE
             if session is not None:
                 window._session_consecutive_failures=0
                 # The window launches without media arguments: never expose
@@ -686,10 +718,12 @@ def _refresh_session_async(window):
     threading.Thread(target=worker,daemon=True).start()
 
 def _poll_session(window):
+    if getattr(window.play, "closed", False): return GLib.SOURCE_REMOVE
     _refresh_session_async(window)
     return GLib.SOURCE_CONTINUE
 
 def _post_progress(window):
+    if getattr(window.play, "closed", False): return GLib.SOURCE_REMOVE
     if (
         not SESSION_BASE
         or getattr(window,"_progress_posting",False)
@@ -729,6 +763,9 @@ def _post_progress(window):
                     "video_streams":video_streams,
                     "audio_streams":audio_streams,
                     "seekable":seekable,
+                    "backend":getattr(window,"_decoder_backend","gstreamer"),
+                    "rendered_frames":getattr(window,"_decoder_rendered_frames",0),
+                    "audio_ready":getattr(window,"_decoder_audio_ready",False),
                 },
                 timeout=4,
             )
@@ -767,6 +804,7 @@ def _schedule_media_seek(window,target_ns,media_revision):
     def try_seek():
         nonlocal attempts
         current=getattr(window,"_media_session",{}) or {}
+        if getattr(window.play, "closed", False): return GLib.SOURCE_REMOVE
         if (getattr(window,"_media_generation",0)!=generation
                 or getattr(window,"_seek_request_serial",0)!=serial
                 or current.get("media_revision")!=media_revision):
@@ -847,7 +885,7 @@ def _play_session(window,session):
     window._decoder_state="loading"
     window._decoder_video_streams=0
     window._decoder_audio_streams=0
-    window._decoder_uri=_generation_uri(media_url)
+    window._decoder_uri=media_url if BACKEND == "libmpv" else _generation_uri(media_url)
     _original_play_video(window,Gio.File.new_for_uri(window._decoder_uri))
     # Gio canonicalizes file URIs and strips fragments; restore identity on
     # GstPlay itself before playing (filesrc ignores that fragment).
@@ -857,7 +895,7 @@ def _play_session(window,session):
         window.unpause()
     _set_external_subtitle(window,subtitle_uri)
     resume_us=max(0,int(session.get("resume_us") or 0))
-    if resume_us>5_000_000:
+    if resume_us > 0 and (BACKEND == "libmpv" or resume_us > 5_000_000):
         _schedule_media_seek(window,resume_us*1000,session.get("media_revision"))
 
 
@@ -893,7 +931,7 @@ def _navigate(window,direction):
             try:
                 _set_session(window,session)
             except Exception as exc:
-                _toast(window,f"Could not switch episode: {exc}")
+                _toast(window,f"Could not switch episode: {type(exc).__name__}")
             window._media_busy=False
             return GLib.SOURCE_REMOVE
         GLib.idle_add(finish)
@@ -908,7 +946,7 @@ def _generate_subtitle(window,track_id):
         except Exception as exc:
             result=None; error=exc
         def finish():
-            if error: _toast(window,f"Subtitle generation could not start: {error}")
+            if error: _toast(window,f"Subtitle generation could not start: {type(error).__name__}")
             elif result: _set_session(window,result)
             return GLib.SOURCE_REMOVE
         GLib.idle_add(finish)
@@ -923,7 +961,7 @@ def _generate_study(window,track_id):
         except Exception as exc:
             result=None; error=exc
         def finish():
-            if error: _toast(window,f"Study subtitles could not start: {error}")
+            if error: _toast(window,f"Study subtitles could not start: {type(error).__name__}")
             elif result: _set_session(window,result)
             return GLib.SOURCE_REMOVE
         GLib.idle_add(finish)
@@ -953,7 +991,7 @@ def _subtitle_action(window,action,parameter):
             updated=None; error=exc
         def finish():
             if error:
-                _toast(window,f"Could not change subtitles: {error}"); return GLib.SOURCE_REMOVE
+                _toast(window,f"Could not change subtitles: {type(error).__name__}"); return GLib.SOURCE_REMOVE
             _set_session(window,updated)
             action.set_state(GLib.Variant.new_string(track_id))
             return GLib.SOURCE_REMOVE
@@ -1122,6 +1160,12 @@ def _premium_on_choose_subtitles(self,dialog,res):
         return
     if not gfile:
         return
+    if BACKEND == "libmpv":
+        _clear_study_overlay(self)
+        _apply_subtitle_cues(self, [])
+        self._custom_subtitle_active = True
+        self.play.fetch_subtitle(gfile.get_uri())
+        return
     try:
         loaded=gfile.load_contents(None)
         data=next((item for item in loaded if isinstance(item,(bytes,bytearray))),None)
@@ -1144,12 +1188,16 @@ def _premium_on_choose_subtitles(self,dialog,res):
             pass
         _toast(self,f'Loaded {name}')
     except Exception as exc:
-        _toast(self,f'Could not load subtitles: {exc}')
+        _toast(self,f'Could not load subtitles: {type(exc).__name__}')
 
 
 def _premium_init(self,**kwargs):
     _original_init(self,**kwargs)
-    _SESSION_WINDOWS[self.play.get_message_bus()] = self
+    if BACKEND == "libmpv":
+        from showtime_libmpv_gtk import bind_window
+        bind_window(self)
+    else:
+        _SESSION_WINDOWS[self.play.get_message_bus()] = self
     if SESSION_URL: _install_session_ui(self)
 
 def _install_video_request_headers(window, header_map):
@@ -1159,6 +1207,11 @@ def _install_video_request_headers(window, header_map):
     In GStreamer the souphttpsrc element exposes these as extra-headers, while
     urisourcebin creates the actual HTTP source deeper in its bin.
     """
+    if BACKEND == "libmpv":
+        from showtime_libmpv import validated_headers
+        validated_headers(header_map)
+        window.play.headers = dict(header_map or {})
+        return
     window._media_header_generation = getattr(window, "_media_header_generation", 0) + 1
     generation = window._media_header_generation
     for obj, handler in getattr(window, "_media_header_handlers", []):
@@ -1232,13 +1285,13 @@ def _premium_play_video(self,gfile):
     self._decoder_state="loading"
     self._decoder_video_streams=0
     self._decoder_audio_streams=0
-    self._decoder_uri=_generation_uri(gfile.get_uri())
+    self._decoder_uri=gfile.get_uri() if BACKEND == "libmpv" else _generation_uri(gfile.get_uri())
     _original_play_video(self,Gio.File.new_for_uri(self._decoder_uri))
     if self.play.props.uri != self._decoder_uri:
         self.play.props.uri = self._decoder_uri
     if subtitle_uri:
         _set_external_subtitle(self,subtitle_uri)
-    if SESSION_URL:
+    if SESSION_URL and not session.get("pause", False):
         # The subtitle and video setup may both pause the underlying pipeline.
         # Start the new video only after its subtitle source is attached.
         self.unpause()
@@ -1326,6 +1379,18 @@ def _premium_build_menus(self,media_info):
     root=self.get_root()
     if SESSION_URL and isinstance(root,Window): _rebuild_subtitle_menu(root)
 
+if BACKEND == "libmpv":
+    _native_original_subtitles_selected = Window._on_subtitles_selected
+    def _native_subtitles_selected(self, action, state):
+        _clear_study_overlay(self)
+        _apply_subtitle_cues(self, [])
+        self._custom_subtitle_active = True
+        # Invalidate an in-flight controller subtitle download without removing
+        # the embedded/native track whose index the user just selected.
+        self.play.subtitle_serial += 1
+        _native_original_subtitles_selected(self, action, state)
+    Window._on_subtitles_selected = _native_subtitles_selected
+
 Window.__init__=_premium_init
 Window.play_video=_premium_play_video
 Window._on_position_updated=_premium_position_updated
@@ -1336,7 +1401,17 @@ Window._on_playback_state_changed=_premium_playback_state_changed
 Window._on_choose_subtitles=_premium_on_choose_subtitles
 Options.build_menus=_premium_build_menus
 
+if BACKEND == "libmpv":
+    from showtime_libmpv_gtk import install as _install_native
+    _original_play_video = _install_native(_window_module, _report_decoder_event, _post_progress, bool(SESSION_URL))
+
 from showtime import main
+if BACKEND == "libmpv" and SESSION_URL:
+    # Upstream Showtime leaves MPRIS Next/Previous empty for a single file.
+    # Kunai owns episode resolution; use the same bridge as its GTK buttons.
+    from showtime.mpris import MPRIS
+    MPRIS._next = lambda self: _navigate(self.win, "next") if self.win else None
+    MPRIS._previous = lambda self: _navigate(self.win, "previous") if self.win else None
 # The real Showtime application is a D-Bus singleton. Without NON_UNIQUE,
 # later Kunai invocations forward URLs to an old process with old session
 # headers, dead bridge ports and outdated controllers.

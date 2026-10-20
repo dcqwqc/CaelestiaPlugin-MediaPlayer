@@ -196,6 +196,9 @@ def parse_ffmeta(path):
 
 class Bridge:
     def __init__(self, cfg):
+        self.backend = os.environ.get("SHOWTIME_BACKEND", "gstreamer")
+        if self.backend not in ("gstreamer", "libmpv"):
+            raise ValueError("Unsupported SHOWTIME_BACKEND")
         self.token = secrets.token_urlsafe(32)
         self.media_token = secrets.token_urlsafe(32)
         # Only URLs explicitly listed in current HLS manifests; previous
@@ -521,23 +524,22 @@ class Bridge:
                         f"{self.base_url}/api/subtitles/{urllib.parse.quote(selected)}.vtt"
                         f"?token={urllib.parse.quote(self.token)}"
                     )
+            media_url = Path(self.url).resolve().as_uri() if self.url.startswith("/") else self.url
+            headers = self.header_dict()
+            if self.backend == "gstreamer":
+                adaptive = (media_proxy_url(self.url, self.media_proxy_port, self.media_token)
+                            if self.http_headers else None)
+                if self.media_proxy_port and is_vixsrc_hls(self.url):
+                    media_url = (f"http://127.0.0.1:{self.media_proxy_port}"
+                                 f"{VIX_PREFIX}{self.media_token}/master.m3u8")
+                elif adaptive:
+                    media_url = adaptive
+                if is_vixsrc_hls(self.url) or adaptive:
+                    headers = {}
             return {
                 "ok": True,
-                "media_url": (
-                    f"http://127.0.0.1:{self.media_proxy_port}{VIX_PREFIX}{self.media_token}/master.m3u8"
-                    if self.media_proxy_port and is_vixsrc_hls(self.url)
-                    else (
-                        media_proxy_url(self.url, self.media_proxy_port, self.media_token)
-                        if self.http_headers else None
-                    ) or (
-                        Path(self.url).resolve().as_uri() if self.url.startswith("/") else self.url
-                    )
-                ),
-                "http_headers": (
-                    {} if is_vixsrc_hls(self.url) or (self.http_headers and media_proxy_url(
-                        self.url, self.media_proxy_port, self.media_token
-                    )) else media_header_dict(self.http_headers)
-                ),
+                "media_url": media_url,
+                "http_headers": headers,
                 "anime_title": self.title,
                 "episode": "",
                 "previous_episode": self.prev_label if self.can_prev else None,
@@ -605,14 +607,25 @@ class Bridge:
             self.decoder_state = state
             if advancing:
                 self.decoder_last_progress = now
+            native = self.backend == "libmpv"
+            native_video_ready = (body.get("backend") == "libmpv"
+                                  and type(body.get("rendered_frames")) is int
+                                  and body["rendered_frames"] > 0 and video_streams > 0)
+            native_audio_ready = (body.get("backend") == "libmpv"
+                                  and video_streams == 0 and audio_streams > 0
+                                  and body.get("audio_ready") is True)
+            output_ready = not native or native_video_ready or native_audio_ready
             # GstPlay exposes timeline progress, not rendered-frame delivery.
             # Never promote this fallback into vo-configured/rendered evidence.
-            if (not self.decoder_ready and advancing
+            if (not self.decoder_ready and advancing and output_ready
                     and (video_streams > 0 or audio_streams > 0)):
                 self.decoder_ready = True
                 self.prop("core-idle", False)
                 self.prop("idle-active", False)
-                self.prop("user-data/kunai-readiness", "position-progress")
+                self.prop("vo-configured", native_video_ready if native else False)
+                self.prop("user-data/kunai-readiness",
+                          "rendered-frame-progress" if native_video_ready and native
+                          else "audio-progress" if native else "position-progress")
                 self.broadcast({"event": "file-loaded"})
                 self.broadcast({"event": "playback-restart"})
             self.prop("seeking", False)
@@ -1089,6 +1102,11 @@ def launch_showtime(bridge, http_port):
     # Showtime retrieves the media URL from authenticated /api/session itself.
     # Keep signed URLs and the loopback media bearer out of process argv.
     cmd += ["org.gnome.Showtime", str(SHOWTIME_BOOTSTRAP), "--new-window"]
+    if bridge.backend == "libmpv":
+        from showtime_host import host_command, preflight
+        cmd, env = host_command(SHOWTIME_BOOTSTRAP,
+                                f"http://127.0.0.1:{http_port}/api/session", bridge.token, env)
+        preflight(cmd, env)
     debug_log=env.get("KUNAI_SHOWTIME_DEBUG_LOG")
     if debug_log:
         # Explicit diagnostics only. No default media URLs or credentials in logs.
@@ -1130,12 +1148,15 @@ def main(argv):
             bridge.check_watchdog()
             time.sleep(0.5)
     threading.Thread(target=watchdog, daemon=True).start()
-    proc = launch_showtime(bridge, http_port)
+    proc = None
+    code = 1
     try:
+        proc = launch_showtime(bridge, http_port)
         code = proc.wait()
     except KeyboardInterrupt:
-        proc.terminate()
-        code = proc.wait()
+        if proc is not None:
+            proc.terminate()
+            code = proc.wait()
     finally:
         bridge.closed = True
         with bridge.lock:

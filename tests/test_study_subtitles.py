@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-import json, subprocess, tempfile
+import json, os, subprocess, tempfile
 from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]
-PYTHON=Path.home()/'.local/share/media-player/ai-env/bin/python'
+PYTHON=Path(os.environ.get('MEDIA_PLAYER_AI_TEST_PYTHON',
+                           str(Path.home()/'.local/share/media-player/ai-env/bin/python')))
 SCRIPT=ROOT/'scripts/study-subtitles.py'
 
 with tempfile.TemporaryDirectory() as d:

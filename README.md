@@ -34,3 +34,22 @@ Run:
 ```
 
 The installer ensures GNOME Showtime is present, points `~/.local/bin/ani-cli` at the wrapper, and registers Showtime for supported video/HLS MIME types.
+
+
+## Opt-in embedded libmpv backend
+
+`SHOWTIME_BACKEND=libmpv` selects the host-side backend through the Kunai
+`scripts/showtime-mpv-shim.py` launcher. It embeds libmpv in the genuine
+Showtime 50.0 GTK interface, uses original source URLs and native mpv/FFmpeg
+network/decoder behavior, and retains the existing authenticated session bridge.
+No separate mpv window is opened. The default remains GStreamer until full live
+validation passes; `SHOWTIME_BACKEND=gstreamer` is the rollback switch.
+
+Host dependencies and trusted Showtime resources/modules must be prepared first.
+The offline nonroot `scripts/provision-showtime-libmpv` verifies package and
+Flatpak signatures and creates a versioned runtime without changing the installed
+Flatpak or desktop defaults. Native launch fails closed on missing dependencies.
+
+See [runtime setup, test evidence and manual release gates](docs/libmpv-validation.md).
+Wayland, audible output, the complete Showtime UI/MPRIS, real provider coverage,
+and multi-minute Kunai playback still require scheduled desktop validation.
