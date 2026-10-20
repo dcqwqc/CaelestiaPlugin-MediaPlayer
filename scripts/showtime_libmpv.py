@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+from urllib.parse import urlsplit
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -37,6 +38,47 @@ def nanoseconds(value):
         return int(number * NS) if math.isfinite(number) and number > 0 else 0
     except (TypeError, ValueError):
         return 0
+
+
+def subtitle_request(uri, source_headers):
+    """Build a minimal subtitle request without disclosing media credentials.
+
+    Subtitle CDNs for anime sources require the embedding page's Referer and
+    User-Agent. Never forward Cookie, Authorization or arbitrary media headers.
+    """
+    parsed = urlsplit(uri)
+    if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError('Invalid subtitle URL')
+    allowed = {}
+    for key, value in (source_headers or {}).items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        if not value or len(value) > 2048 or any(ch in value for ch in '\r\n\0'):
+            continue
+        if key.lower() == 'user-agent':
+            allowed['User-Agent'] = value
+        elif key.lower() in ('referer', 'referrer'):
+            ref = urlsplit(value)
+            if ref.scheme in ('https', 'http') and ref.hostname and not ref.username and not ref.password:
+                allowed['Referer'] = value
+    return urllib.request.Request(uri, headers=allowed)
+
+
+def subtitle_suffix(payload, uri=''):
+    """Preserve subtitle format for mpv's demuxer, rather than using .sub.
+
+    A generic .sub extension causes mpv/FFmpeg to probe an incompatible
+    subtitle codec for WebVTT from HLS anime providers.
+    """
+    lead = bytes(payload[:4096]).lstrip(b'\xef\xbb\xbf\x20\t\r\n')
+    if lead.startswith(b'WEBVTT'):
+        return '.vtt'
+    if lead.startswith((b'[Script Info]', b'[V4+ Styles]', b'[Events]')):
+        return '.ass'
+    if b'-->' in lead:
+        return '.srt'
+    suffix = Path(urlsplit(uri).path).suffix.lower()
+    return suffix if suffix in {'.vtt', '.srt', '.ass', '.ssa'} else '.txt'
 
 
 class Track:
@@ -295,15 +337,41 @@ class Player:
     def get_message_bus(self): return None
     def get_bus(self): return None
     def set_audio_track(self, index):
-        if self.info: self.core.aid = self.info.audio[index].data['id']
+        if not self.core or not self.info or not isinstance(index, int):
+            return False
+        if not 0 <= index < len(self.info.audio):
+            return False
+        self.core.aid = self.info.audio[index].data['id']
+        return True
     def get_current_audio_track(self):
         return next((t for t in self.info.audio if t.data.get('selected')), None) if self.info else None
     def set_subtitle_track(self, index):
-        if self.info:
-            self.selected_subtitle = self.info.subs[index].data['id']
-            self.core.sid = self.selected_subtitle
+        # Menus can outlive a source revision for a few GTK frames.
+        # Do not let stale actions index outside the new track list or
+        # turn an unrelated healthy video into a fatal playback error.
+        if not self.core or not self.info or not isinstance(index, int):
+            return False
+        if not 0 <= index < len(self.info.subs):
+            return False
+        native_id = self.info.subs[index].data.get('id')
+        if native_id is None:
+            return False
+        try:
+            self.core.sid = native_id
+        except Exception:
+            self.emit('subtitle-error', None)
+            return False
+        self.selected_subtitle = native_id
+        return True
     def set_subtitle_track_enabled(self, enabled):
-        if self.core: self.core.sid = (self.selected_subtitle or 'auto') if enabled else 'no'
+        if not self.core:
+            return False
+        try:
+            self.core.sid = (self.selected_subtitle if self.selected_subtitle is not None else 'auto') if enabled else 'no'
+        except Exception:
+            self.emit('subtitle-error', None)
+            return False
+        return True
     def external_subtitle(self, uri):
         if uri == self.subtitle: return
         if self.core and self.info:
@@ -312,27 +380,35 @@ class Player:
         self.subtitle = uri
         if self.core and self.loaded and uri: self.core.command('sub-add', uri, 'select')
     def fetch_subtitle(self, uri):
-        """Fetch external subtitles without the media core's provider headers.
+        """Fetch subtitle with source Referer/UA, never with media credentials.
 
-        Decode/render with mpv from a private local file, so provider cookies
-        cannot be sent to the bridge, a subtitle host, or a redirected URL.
+        Decode/render from a private local file, not a remote mpv URL. The
+        source's auth cookies/tokens stay with the media request only.
         """
         self.subtitle_serial += 1
         serial, generation = self.subtitle_serial, self.generation
         self.external_subtitle(None)
         if not uri: return
+        source_headers = dict(self.headers)
         def worker():
             try:
-                with urllib.request.urlopen(uri, timeout=8) as response:
+                request = subtitle_request(uri, source_headers)
+                with urllib.request.urlopen(request, timeout=8) as response:
                     data = response.read(16 * 1024 * 1024 + 1)
                 if len(data) > 16 * 1024 * 1024:
                     raise ValueError('Subtitle is too large')
                 def apply():
                     if self.closed or generation != self.generation or serial != self.subtitle_serial:
                         return
-                    path = Path(self.subtitle_files.name) / f'{generation}-{serial}.sub'
-                    path.write_bytes(data)
-                    self.external_subtitle(str(path))
+                    suffix = subtitle_suffix(data, uri)
+                    path = Path(self.subtitle_files.name) / f'{generation}-{serial}{suffix}'
+                    try:
+                        path.write_bytes(data)
+                        self.external_subtitle(str(path))
+                    except Exception:
+                        # Invalid VTT, a withdrawn track, or a native demuxer
+                        # error should never terminate the video itself.
+                        self.emit('subtitle-error', None)
                 self.dispatch(apply)
             except Exception:
                 # A subtitle error must not terminate otherwise healthy video.

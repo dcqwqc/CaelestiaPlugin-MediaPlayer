@@ -671,7 +671,11 @@ def _set_session(window,session,refresh_menu=True):
             _set_external_subtitle(window,session.get("subtitle_url"))
         else:
             _set_external_subtitle(window,None)
-    elif old_selected and new_selected!=old_selected and not getattr(window,"_custom_subtitle_active",False):
+    elif old_selected and new_selected!=old_selected:
+        # A newly selected provider subtitle takes precedence over any
+        # previously chosen custom overlay. Keep custom subtitles only while
+        # the session's selected ID remains unchanged.
+        window._custom_subtitle_active=False
         if new_selected.startswith("study-ja-") and session.get("study_url"):
             _set_study_subtitle(window,session.get("study_url"))
         else:

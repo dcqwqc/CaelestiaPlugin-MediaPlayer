@@ -9,7 +9,7 @@ import pytest
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'scripts'
 sys.path.insert(0, str(SCRIPTS))
-from showtime_libmpv import Player, MediaInfo, nanoseconds, validated_headers
+from showtime_libmpv import Player, MediaInfo, nanoseconds, validated_headers, subtitle_suffix, subtitle_request
 from showtime_host import verify_runtime, host_command
 
 
@@ -126,6 +126,117 @@ def test_track_menu_indices_map_to_native_ids(player):
     player.set_subtitle_track_enabled(True); assert c.sid == 23
     assert player.info.get_subtitle_streams()[0].get_tags().get_string('title') == (True, 'English')
     assert player.info.get_number_of_video_streams() == 1
+
+
+def test_stale_or_invalid_subtitle_actions_never_stop_video(player):
+    c = load(player)
+    c.track_list = [{'type': 'audio', 'id': 1}, {'type': 'sub', 'id': 17, 'lang': 'en'}]
+    player.sample()
+    assert player.set_subtitle_track(0) is True
+    assert c.sid == 17
+    assert player.set_subtitle_track(4) is False
+    assert player.set_subtitle_track(-1) is False
+    assert player.set_subtitle_track_enabled(False) is True
+    assert player.set_subtitle_track_enabled(True) is True
+    # A different episode may have cleared all native track entries while
+    # the GTK menu is still displayed.
+    player.info = MediaInfo(player.uri, [], 'New episode')
+    assert player.set_subtitle_track(0) is False
+    assert player.set_audio_track(0) is False
+    assert not player.terminal
+    assert not any(k == 'error' for k, _ in player.events)
+
+
+def test_anime_webvtt_uses_matching_file_type_not_generic_sub():
+    assert subtitle_suffix(b'WEBVTT\n\n00:00:00.1 --> 00:00:01.2\nHi', 'https://test/sub') == '.vtt'
+    assert subtitle_suffix(b'\xef\xbb\xbfWEBVTT\n', 'https://test/a.sub') == '.vtt'
+    assert subtitle_suffix(b'1\n00:00:00,100 --> 00:00:01,000\nHi') == '.srt'
+    assert subtitle_suffix(b'[Script Info]\nTitle: Anime') == '.ass'
+    assert subtitle_suffix(b'unrecognized', 'https://test/a.m3u8') == '.txt'
+
+
+def test_external_english_webvtt_attached_without_media_credentials(monkeypatch, player):
+    import threading
+    class FakeResponse:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self, _limit):
+            return b'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nEnglish\n'
+    seen = []
+    completed = threading.Event()
+    def fetch(request, timeout):
+        seen.append((request.full_url, dict(request.header_items())))
+        completed.set()
+        return FakeResponse()
+    monkeypatch.setattr('showtime_libmpv.urllib.request.urlopen', fetch)
+    c = load(player)
+    player.headers = {
+        'Authorization': 'Bearer private-media-token',
+        'Cookie': 'session=private',
+        'Referer': 'https://embed.example/watch',
+        'User-Agent': 'Showtime-Test-UA',
+    }
+    player.fetch_subtitle('https://subs.example/english.vtt')
+    assert completed.wait(3)
+    for _ in range(50):
+        player.drain()
+        if player.subtitle: break
+        import time
+        time.sleep(.01)
+    assert player.subtitle is not None and player.subtitle.endswith('.vtt')
+    assert Path(player.subtitle).read_bytes().startswith(b'WEBVTT')
+    assert ('sub-add', player.subtitle, 'select') in c.commands
+    assert seen[0][0] == 'https://subs.example/english.vtt'
+    sent_headers = {k.lower(): v for k, v in seen[0][1].items()}
+    assert sent_headers['referer'] == 'https://embed.example/watch'
+    assert sent_headers['user-agent'] == 'Showtime-Test-UA'
+    assert 'cookie' not in sent_headers and 'authorization' not in sent_headers
+    assert not player.terminal
+    assert not any(k == 'error' for k, _ in player.events)
+    player.close()
+
+
+def test_subtitle_http_failure_is_nonfatal(monkeypatch, player):
+    import urllib.error
+    import threading
+    did_fetch = threading.Event()
+    def deny(request, timeout):
+        did_fetch.set()
+        raise urllib.error.HTTPError(request.full_url, 403, 'Forbidden', None, None)
+    monkeypatch.setattr('showtime_libmpv.urllib.request.urlopen', deny)
+    c = load(player)
+    player.fetch_subtitle('https://cdn.example/subtitles.vtt')
+    assert did_fetch.wait(3)
+    for _ in range(40):
+        player.drain()
+        if any(kind == 'subtitle-error' for kind, _ in player.events):
+            break
+        import time
+        time.sleep(.01)
+    assert ('subtitle-error', None) in player.events
+    assert not player.terminal
+    assert not any(kind == 'error' for kind, _ in player.events)
+    assert not any(command[0] == 'stop' for command in c.commands)
+    player.close()
+
+
+def test_subtitle_request_filters_credentials_and_invalid_urls():
+    req = subtitle_request('https://subs.example/en.vtt', {
+        'Cookie': 'session=private',
+        'Authorization': 'Bearer private',
+        'Referer': 'https://embed.example/watch',
+        'User-Agent': 'UA',
+        'Origin': 'https://hidden.example',
+    })
+    headers = {name.lower(): value for name, value in req.header_items()}
+    assert headers == {'referer': 'https://embed.example/watch', 'user-agent': 'UA'}
+    for url in ('file:///etc/passwd', 'javascript:alert(1)', 'https://u:p@subs.example/file.vtt'):
+        with pytest.raises(ValueError):
+            subtitle_request(url, {})
+    assert 'referer' not in {
+        k.lower(): v for k, v in subtitle_request('https://subs.example/en.vtt',
+            {'Referer': 'https://x.example/watch\r\nCookie: evil'}).header_items()
+    }
 
 
 def test_external_subtitle_change_removes_old_external_tracks(player):
