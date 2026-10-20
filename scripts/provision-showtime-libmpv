@@ -30,9 +30,10 @@ def verify_showtime(location, commit, origin):
 def provision(args):
     if args.destination.exists():
         raise RuntimeError('Destination exists; choose a new versioned directory')
-    # Verify against the system distributor keyring; a key supplied beside the
-    # package is not a trust anchor. gpgv does not fetch keys or change trust.
-    subprocess.run(['gpgv', '--keyring', str(args.keyring.resolve()),
+    # The Arch distribution keyring is ASCII-armored, so gpgv --keyring
+    # cannot load it directly. pacman-key validates with the installed
+    # distribution trust database without importing or trusting new keys.
+    subprocess.run(['pacman-key', '--verify',
                     str(args.signature.resolve()), str(args.mpv_package.resolve())],
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     location = Path(subprocess.check_output(
