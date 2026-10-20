@@ -56,7 +56,7 @@ def provision(tmp_path, monkeypatch):
 def test_snapshot_installed_site_packages_and_resources(provision):
     m, args, calls = provision
     m.provision(args)
-    assert calls[0][0] == 'gpgv' and calls[1][0] == 'verify-flatpak'
+    assert calls[0][0] == 'pacman-key' and calls[1][0] == 'verify-flatpak'
     assert verify_runtime(args.destination) == args.destination
     assert (args.destination / 'python/mpv.py').read_text() == '# verified fixture'
     assert not (args.destination.parent / 'unwanted').exists()
