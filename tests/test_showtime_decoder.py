@@ -50,6 +50,22 @@ class DecoderTests(unittest.TestCase):
     def ends(self):
         return [x for x in self.events if x.get('event') == 'end-file']
 
+    def test_showtime_extracts_http_denial_from_gstreamer_details(self):
+        status = player_function("_gst_http_status", {})
+        denied = SimpleNamespace(
+            has_field=lambda key: key == "http-status-code",
+            get_value=lambda key: 403,
+        )
+        forbidden = SimpleNamespace(
+            has_field=lambda key: key == "http-status-code",
+            get_value=lambda key: "429",
+        )
+        missing = SimpleNamespace(has_field=lambda _: False)
+        self.assertEqual(status(denied), 403)
+        self.assertEqual(status(forbidden), 429)
+        self.assertIsNone(status(missing))
+        self.assertIsNone(status(None))
+
     def test_metadata_duration_and_frozen_resume_do_not_signal_success(self):
         self.assertFalse(self.b.properties['vo-configured'])
         self.assertTrue(self.b.properties['core-idle'])
@@ -216,10 +232,11 @@ class PlayerGenerationTests(unittest.TestCase):
         gst = SimpleNamespace(PlayMessage=kinds, play_message_get_uri=lambda m: m.uri,
                               play_message_parse_type=lambda m: m.kind,
                               play_message_parse_error=lambda m: (SimpleNamespace(message='codec failure'), None))
-        env = {'_SESSION_WINDOWS': {'bus': window}, 'SESSION_URL': 'session', 'GstPlay': gst,
+        env = {'_SESSION_WINDOWS': {'bus': window}, 'SESSION_URL': 'session', 'GstPlay': gst, 'os': os,
                '_original_play_bus_message': lambda *args: forwarded.append(args[-1].kind),
                '_report_decoder_event': lambda *args: reported.append(args[1:]),
-               '_is_source_access_denied': lambda msg: False}
+               '_is_source_access_denied': lambda msg: False,
+               '_gst_http_status': player_function('_gst_http_status', {})}
         handler = player_function('_guarded_play_bus_message', env)
         for kind in ('error', 'eos', 'position', 'info', 'state'):
             handler(None, 'bus', SimpleNamespace(uri='https://cdn.invalid/v#old', kind=kind))

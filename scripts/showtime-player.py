@@ -103,8 +103,15 @@ def _guarded_play_bus_message(messenger, bus, message):
     elif kind == GstPlay.PlayMessage.ERROR:
         error, _details = GstPlay.play_message_parse_error(message)
         window._decoder_state = "failed"
+        http_status = _gst_http_status(_details)
+        if os.environ.get("KUNAI_SHOWTIME_TRACE") == "1":
+            # GStreamer details include signed URLs. Report only status, never
+            # the remote URI, headers, or raw exception message.
+            print(f"MediaPlayer trace: playback HTTP status={http_status or 'unknown'}",
+                  file=sys.stderr, flush=True)
+        denied = http_status in (401, 403, 429) or _is_source_access_denied(error.message)
         _report_decoder_event(window, "playback-error",
-                              "access-denied" if _is_source_access_denied(error.message) else "playback-failed")
+                              "access-denied" if denied else "playback-failed")
     elif kind == GstPlay.PlayMessage.END_OF_STREAM:
         _report_decoder_event(window, "playback-eof")
     result = _original_play_bus_message(messenger, bus, message)
@@ -1278,6 +1285,18 @@ def _premium_position_updated(self,obj,pos):
     if not _update_study_overlay(self,pos):
         _update_subtitle_overlay(self,pos)
     if SESSION_URL: _update_timed_ui(self,pos)
+
+def _gst_http_status(details):
+    # The GstPlay error message often says only "resource not found" while its
+    # details carry the actual 401/403/429. That distinction must reach Kunai.
+    try:
+        if details and details.has_field("http-status-code"):
+            code = int(details.get_value("http-status-code"))
+            return code if 100 <= code <= 599 else None
+    except (TypeError, ValueError, OverflowError, AttributeError):
+        pass
+    return None
+
 
 def _is_source_access_denied(message):
     """Recognize upstream HTTP authorization denial, not codec failures."""

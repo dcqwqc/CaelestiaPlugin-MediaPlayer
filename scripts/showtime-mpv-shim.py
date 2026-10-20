@@ -198,6 +198,9 @@ class Bridge:
     def __init__(self, cfg):
         self.token = secrets.token_urlsafe(32)
         self.media_token = secrets.token_urlsafe(32)
+        # Only URLs explicitly listed in current HLS manifests; previous
+        # tokens and their cross-CDN routes are revoked on media replacement.
+        self.external_media_refs = {}
         self.media_proxy_port = None
         self.lock = threading.RLock()
         self.cond = threading.Condition(self.lock)
@@ -676,6 +679,7 @@ class Bridge:
                 self.broadcast({"event": "end-file", "reason": "stop"})
             self.url = str(url)
             self.media_token = secrets.token_urlsafe(32)
+            self.external_media_refs.clear()
             self.subtitles = []
             self.selected_subtitle_id = "off"
             self.subtitle = None
