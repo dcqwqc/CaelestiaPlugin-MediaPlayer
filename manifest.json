@@ -5,6 +5,5 @@
   "homepage": "https://github.com/dcqwqc/CaelestiaPlugin-MediaPlayer",
   "icon": "movie",
   "description": "Customized GNOME Showtime media player integration for Caelestia and ani-cli with native subtitles, seeking, resume, fullscreen and protected-HLS support.",
-  "entryPoints": [],
-  "requires": ">=2.1.0"
+  "entryPoints": []
 }
